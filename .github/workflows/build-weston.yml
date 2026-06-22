@@ -1,0 +1,93 @@
+name: Build Weston Packages
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: 'Linux Distribution'
+        required: true
+        default: 'Debian 13'
+        type: choice
+        options:
+          - Debian 13
+      tag:
+        description: 'Tag'
+        required: true
+        default: 'anland-1.11-debian-14.0.2-90'
+
+permissions:
+  contents: write
+
+jobs:
+  debian-trixie:
+    if: ${{ github.event.inputs.distribution == 'Debian 13' }}
+    runs-on: ubuntu-24.04-arm
+    container:
+      image: debian:trixie
+      options: --privileged --user root
+
+    steps:
+      - name: Install dependencies
+        run: |
+          sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources
+          apt update
+          apt build-dep -y weston
+          apt install -y git ccache build-essential devscripts fakeroot quilt git-buildpackage pristine-tar
+
+      - name: Cache ccache
+        uses: actions/cache@v5
+        with:
+          path: /root/.ccache
+          key: ccache-weston-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            ccache-weston-${{ runner.os }}-${{ runner.arch }}-
+
+      - name: Configure ccache
+        run: |
+          export CCACHE_DIR=/root/.ccache
+          ccache --max-size=2G
+          ccache --show-config
+          ccache --zero-stats
+          ccache --show-stats
+
+      - name: Clone repository
+        run: |
+          cd ~
+          git config --global user.email "actions@github.com"
+          git config --global user.name "GitHub Actions"
+          git clone -b ${{ github.event.inputs.tag }} --depth 1 https://github.com/lfdevs/weston.git weston
+
+      - name: Build Weston
+        shell: bash
+        run: |
+          export CCACHE_DIR=/root/.ccache
+          echo "Building Weston..."
+          cd ~/weston
+          origtargz
+          gbp buildpackage -uc -us -jauto --git-ignore-branch
+          echo "Weston build completed successfully!"
+
+      - name: Save ccache
+        uses: actions/cache/save@v5
+        if: always()
+        with:
+          path: /root/.ccache
+          key: ccache-weston-${{ runner.os }}-${{ runner.arch }}-${{ github.run_id }}-${{ github.run_attempt }}
+
+      - name: Collect packages
+        shell: bash
+        run: |
+          cd ~
+          rm -f *dev* *dbgsym*
+          echo "Calculating sha256 checksums..."
+          find . -maxdepth 1 \( -name "*.deb" \) -type f -printf "%P\0" | xargs -0 sha256sum | sort -k2 > sha256sums.txt
+          cat sha256sums.txt && echo
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: weston_${{ github.event.inputs.tag }}
+          path: |
+            ~/*.deb
+            ~/sha256sums.txt
+          retention-days: 90
