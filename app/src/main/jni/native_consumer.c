@@ -6,6 +6,7 @@
 #include <jni.h>
 #include <pthread.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
@@ -20,8 +21,10 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+#define DEFAULT_SOCKET_PATH "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock"
 #define PIXEL_FORMAT_RGBA_8888 1
 #define MAX_COLLECT_BUFS 8
+#define MAX_SOCKET_PATH 4096
 
 static struct anw_api api;
 static bool api_loaded = false;
@@ -41,6 +44,7 @@ struct consumer_state {
 
     int screen_w;
     int screen_h;
+    char socket_path[MAX_SOCKET_PATH];
 };
 
 static struct consumer_state g_state = {
@@ -189,7 +193,7 @@ static void cleanup_dmabufs(struct consumer_state *s)
 
 static int do_connect(struct consumer_state *s)
 {
-    const char *sock = "/data/local/tmp/display_daemon.sock";
+    const char *sock = s->socket_path[0] ? s->socket_path : DEFAULT_SOCKET_PATH;
 
     if (s->ctx) {
         disconnect(s->ctx);
@@ -297,7 +301,7 @@ static void *render_thread_func(void *arg)
 
 JNIEXPORT void JNICALL
 Java_com_anland_termux_MainActivity_nativeStart(
-    JNIEnv *env, jobject thiz, jobject surface)
+    JNIEnv *env, jobject thiz, jobject surface, jstring socket_path)
 {
     if (!api_loaded) {
         if (anw_api_load(&api) < 0) {
@@ -308,6 +312,14 @@ Java_com_anland_termux_MainActivity_nativeStart(
     }
 
     pthread_mutex_lock(&g_state.lock);
+
+    const char *path = socket_path ? (*env)->GetStringUTFChars(env, socket_path, NULL) : NULL;
+    if (path && path[0])
+        snprintf(g_state.socket_path, sizeof(g_state.socket_path), "%s", path);
+    else
+        snprintf(g_state.socket_path, sizeof(g_state.socket_path), "%s", DEFAULT_SOCKET_PATH);
+    if (path)
+        (*env)->ReleaseStringUTFChars(env, socket_path, path);
 
     if (g_state.running) {
         g_state.running = false;

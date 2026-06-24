@@ -1,6 +1,7 @@
 package com.anland.termux;
 
 import android.app.Activity;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.os.Bundle;
 import android.util.Log;
@@ -18,6 +19,9 @@ import android.view.WindowManager;
 
 public class MainActivity extends Activity implements SurfaceHolder.Callback {
     private static final String TAG = "Anland";
+    private static final String EXTRA_SOCKET_PATH = "socket_path";
+    private static final String DEFAULT_SOCKET_PATH =
+            "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
 
     private SurfaceView surfaceView;
     private boolean surfaceReady = false;
@@ -26,7 +30,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         System.loadLibrary("anland_consumer");
     }
 
-    private native void nativeStart(Surface surface);
+    private native void nativeStart(Surface surface, String socketPath);
     private native void nativeStop();
     private native void nativeSendTouch(int action, float x, float y, int pointerId);
     private native void nativeSendTouchFrame();
@@ -51,6 +55,16 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setupFullscreen();
         setupCursorHiding();
         enterLockTask();
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        if (surfaceReady) {
+            nativeStop();
+            nativeStart(surfaceView.getHolder().getSurface(), getSocketPath());
+        }
     }
 
     private void setupFullscreen() {
@@ -83,7 +97,7 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         setupFullscreen();
         if (surfaceReady) {
             nativeStop();
-            nativeStart(surfaceView.getHolder().getSurface());
+            nativeStart(surfaceView.getHolder().getSurface(), getSocketPath());
         }
     }
 
@@ -102,7 +116,14 @@ public class MainActivity extends Activity implements SurfaceHolder.Callback {
         Log.i(TAG, "surfaceChanged: " + width + "x" + height);
         surfaceReady = true;
         nativeStop();
-        nativeStart(holder.getSurface());
+        nativeStart(holder.getSurface(), getSocketPath());
+    }
+
+    private String getSocketPath() {
+        String path = getIntent().getStringExtra(EXTRA_SOCKET_PATH);
+        if (path == null || path.isEmpty())
+            return DEFAULT_SOCKET_PATH;
+        return path;
     }
 
     @Override
