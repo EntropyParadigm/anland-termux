@@ -1,26 +1,26 @@
 plugins {
-    id "com.android.application" version "8.7.0"
+    id "com.android.application" version "9.2.1"
 }
 
 android {
-    namespace "com.anland.termux"
-    compileSdk 36
+    namespace = "com.anland.termux"
+    compileSdk = 36
 
     signingConfigs {
         termuxGitHub {
-            storeFile rootProject.file("testkey_untrusted.jks")
-            keyAlias "alias"
-            storePassword "xrj45yWGLbsO7W0v"
-            keyPassword "xrj45yWGLbsO7W0v"
+            storeFile = rootProject.file("testkey_untrusted.jks")
+            keyAlias = "alias"
+            storePassword = "xrj45yWGLbsO7W0v"
+            keyPassword = "xrj45yWGLbsO7W0v"
         }
     }
 
     defaultConfig {
-        applicationId "com.anland.termux"
-        minSdk 26
-        targetSdk 36
-        versionCode 1
-        versionName "0.1.0"
+        applicationId = "com.anland.termux"
+        minSdk = 26
+        targetSdk = 36
+        versionCode = 1
+        versionName = "1.11.0"
 
         ndk {
             abiFilters "arm64-v8a"
@@ -33,21 +33,21 @@ android {
         }
     }
 
-    ndkVersion "29.0.13113456"
+    ndkVersion = "29.0.14206865"
 
     externalNativeBuild {
         cmake {
-            path "src/main/jni/CMakeLists.txt"
+            path = file("src/main/jni/CMakeLists.txt")
         }
     }
 
     buildTypes {
         debug {
-            signingConfig signingConfigs.termuxGitHub
+            signingConfig = signingConfigs.termuxGitHub
         }
         release {
-            signingConfig signingConfigs.termuxGitHub
-            minifyEnabled false
+            signingConfig = signingConfigs.termuxGitHub
+            minifyEnabled = false
         }
     }
 }

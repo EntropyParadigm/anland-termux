@@ -9,6 +9,12 @@ if ! command -v gradle >/dev/null 2>&1; then
   exit 1
 fi
 
+GRADLE_VERSION="$(gradle --version | awk '/^Gradle / { print $2; exit }')"
+if [[ "$GRADLE_VERSION" != "9.6.0" ]]; then
+  echo "Gradle 9.6.0 is required, found: ${GRADLE_VERSION:-unknown}" >&2
+  exit 1
+fi
+
 mkdir -p "$OUT_DIR"
 
 (cd "$ROOT_DIR/app" && gradle --no-daemon assembleDebug)

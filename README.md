@@ -26,6 +26,15 @@ Build the Android app:
 tools/build-app.sh
 ```
 
+Requirements:
+
+```text
+Android Gradle Plugin 9.2.1
+Gradle 9.6.0
+Android NDK 29.0.14206865
+compileSdk 36
+```
+
 Output:
 
 ```text
