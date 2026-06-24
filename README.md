@@ -32,6 +32,7 @@ Requirements:
 Android Gradle Plugin 9.2.1
 Gradle 9.6.0
 Android NDK 29.0.14206865
+minSdk 30
 compileSdk 36
 ```
 
