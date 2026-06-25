@@ -39,7 +39,7 @@ compileSdk 36
 Output:
 
 ```text
-out/anland-termux-debug.apk
+out/AnlandTermux-<version>.apk
 ```
 
 Build the `anland` daemon for the current system:

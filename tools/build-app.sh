@@ -3,6 +3,13 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="$ROOT_DIR/out"
+VERSION_NAME="$(awk -F'"' '/^[[:space:]]*versionName[[:space:]]*=/ { print $2; exit }' "$ROOT_DIR/app/build.gradle")"
+APK_NAME="AnlandTermux-${VERSION_NAME}.apk"
+
+if [[ -z "$VERSION_NAME" ]]; then
+  echo "Could not read versionName from app/build.gradle" >&2
+  exit 1
+fi
 
 if ! command -v gradle >/dev/null 2>&1; then
   echo "gradle must be available on PATH" >&2
@@ -19,6 +26,6 @@ mkdir -p "$OUT_DIR"
 
 (cd "$ROOT_DIR/app" && gradle --no-daemon assembleDebug)
 cp "$ROOT_DIR/app/build/outputs/apk/debug/app-debug.apk" \
-  "$OUT_DIR/anland-termux-debug.apk"
+  "$OUT_DIR/$APK_NAME"
 
-echo "Built $OUT_DIR/anland-termux-debug.apk"
+echo "Built $OUT_DIR/$APK_NAME"
