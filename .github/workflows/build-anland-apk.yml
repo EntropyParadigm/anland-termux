@@ -1,0 +1,88 @@
+name: Build Anland APK
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Git ref to build"
+        required: true
+        default: "termux"
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-26.04
+
+    env:
+      GRADLE_VERSION: "9.6.0"
+      ANDROID_NDK_VERSION: "29.0.14206865"
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ github.event.inputs.ref }}
+
+      - name: Set up JDK
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "21"
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v6  
+        with:
+          gradle-version: ${{ env.GRADLE_VERSION }}
+
+      - name: Select Android NDK
+        shell: bash
+        run: |
+          set -euo pipefail
+          NDK_HOME="$ANDROID_HOME/ndk/$ANDROID_NDK_VERSION"
+          if [[ ! -d "$NDK_HOME" ]]; then
+            echo "Android NDK $ANDROID_NDK_VERSION not found at $NDK_HOME" >&2
+            echo "Installed NDK versions:" >&2
+            find "$ANDROID_HOME/ndk" -mindepth 1 -maxdepth 1 -type d -printf "  %f\n" >&2
+            exit 1
+          fi
+
+          {
+            echo "ANDROID_NDK=$NDK_HOME"
+            echo "ANDROID_NDK_HOME=$NDK_HOME"
+            echo "ANDROID_NDK_ROOT=$NDK_HOME"
+          } >> "$GITHUB_ENV"
+
+      - name: Show build environment
+        shell: bash
+        run: |
+          set -euo pipefail
+          java -version
+          gradle --version
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          echo "ANDROID_NDK_HOME=$ANDROID_NDK_HOME"
+          ls -la "$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin" | sed -n '1,40p'
+
+      - name: Build APK
+        shell: bash
+        run: |
+          set -euo pipefail
+          tools/build-app.sh
+
+      - name: Calculate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd out
+          sha256sum *.apk | sort -k2 > sha256sums.txt
+          cat sha256sums.txt
+
+      - name: Upload APK artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: anland-termux-apk-${{ github.run_id }}-${{ github.run_attempt }}
+          path: |
+            out/*.apk
+            out/sha256sums.txt
+          retention-days: 90
