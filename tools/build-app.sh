@@ -25,7 +25,14 @@ fi
 mkdir -p "$OUT_DIR"
 
 (cd "$ROOT_DIR/app" && gradle --no-daemon assembleDebug)
-cp "$ROOT_DIR/app/build/outputs/apk/debug/app-debug.apk" \
-  "$OUT_DIR/$APK_NAME"
+
+mapfile -t DEBUG_APKS < <(find "$ROOT_DIR/app/build/outputs/apk/debug" -maxdepth 1 -type f -name "*.apk" | sort)
+if [[ "${#DEBUG_APKS[@]}" -ne 1 ]]; then
+  echo "Expected exactly one debug APK, found ${#DEBUG_APKS[@]}:" >&2
+  printf '  %s\n' "${DEBUG_APKS[@]}" >&2
+  exit 1
+fi
+
+cp "${DEBUG_APKS[0]}" "$OUT_DIR/$APK_NAME"
 
 echo "Built $OUT_DIR/$APK_NAME"
