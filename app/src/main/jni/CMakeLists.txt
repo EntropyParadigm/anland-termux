@@ -22,3 +22,20 @@ target_link_libraries(anland_consumer
     log
     dl
 )
+
+add_executable(fdhelper
+    fd_helper.c
+    ${ANLAND_CORE_DIR}/common/socket_utils.c
+)
+
+target_include_directories(fdhelper PRIVATE
+    ${ANLAND_CORE_DIR}/common
+)
+
+set_target_properties(fdhelper PROPERTIES
+    PREFIX "lib"
+    OUTPUT_NAME "fdhelper"
+    SUFFIX ".so"
+)
+
+target_link_libraries(fdhelper log)

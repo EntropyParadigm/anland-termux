@@ -3,118 +3,84 @@
 #include <android/native_window.h>
 #include <android/native_window_jni.h>
 #include <errno.h>
+#include <poll.h>
 #include <jni.h>
 #include <pthread.h>
 #include <stdbool.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/wait.h>
 #include <dirent.h>
 #include <unistd.h>
 
 #include "anw_hidden.h"
 #include "display_consumer.h"
 #include "protocol.h"
+#include "socket_utils.h"
 
 #define TAG "Anland"
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
-#define DEFAULT_SOCKET_PATH "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock"
 #define PIXEL_FORMAT_RGBA_8888 1
 #define MAX_COLLECT_BUFS 8
-#define MAX_SOCKET_PATH 4096
+
+/* Saved JVM / activity reference for event-thread JNI callbacks. */
+static JavaVM *g_jvm = NULL;
+static jobject g_activity_obj = NULL;
 
 static struct anw_api api;
 static bool api_loaded = false;
+static void on_fallback(void *userdata);
 
+static void on_exit_fallback(void *userdata);
 struct consumer_state {
     pthread_mutex_t lock;
     ANativeWindow *window;
     display_ctx *ctx;
     pthread_t render_thread;
     volatile bool running;
+
+    //Note: it is Deamon's Reconnect, not Fallback Flag
+    //Fallback is maintained by display lib, and the consumer should not care about it.
     volatile bool need_reconnect;
 
     int buf_count;
     int dmabuf_fds[MAX_COLLECT_BUFS];
     struct buf_info dmabuf_infos[MAX_COLLECT_BUFS];
-    void *buf_bits[MAX_COLLECT_BUFS];
+    ANativeWindowBuffer *buf_anb[MAX_COLLECT_BUFS];
 
     int screen_w;
     int screen_h;
-    char socket_path[MAX_SOCKET_PATH];
+
+    // Latest display refresh rate (milli-Hz) reported from Java. Read on
+    // (re)connect to seed the producer; updated live by nativeSetRefreshRate.
+    volatile uint32_t refresh_mhz;
+
+    // Event (output) thread
+    pthread_t event_thread;
+    volatile bool event_running;
 };
 
 static struct consumer_state g_state = {
     .lock = PTHREAD_MUTEX_INITIALIZER,
 };
 
+/* Connection config, set from Java via nativeConfigure() and read on each
+ * (re)connect in do_connect(). Guarded by cfg_lock. */
+static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
+static char cfg_socket_path[256] =
+    "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
+static bool cfg_use_root = false;
+static char cfg_helper_path[512] = "";
+static char cfg_bridge_path[512] = "";
+
 static bool motion_has_last = false;
 static float motion_last_x = 0.0f;
 static float motion_last_y = 0.0f;
-
-static int find_buf_index(struct consumer_state *s, int fd)
-{
-    for (int i = 0; i < s->buf_count; i++) {
-        if (s->dmabuf_fds[i] == fd)
-            return i;
-    }
-    return -1;
-}
-
-/* Find the fd backing a mmap'd address by matching inode from /proc/self/maps
- * against fstat of open fds. */
-static int fd_from_maps(void *addr)
-{
-    FILE *fp = fopen("/proc/self/maps", "r");
-    if (!fp)
-        return -1;
-
-    uintptr_t target = (uintptr_t)addr;
-    char line[512];
-    unsigned long map_inode = 0;
-    bool found_region = false;
-
-    while (fgets(line, sizeof(line), fp)) {
-        uintptr_t start, end;
-        char perms[8];
-        unsigned long offset;
-        unsigned int dev_major, dev_minor;
-        unsigned long inode;
-        if (sscanf(line, "%lx-%lx %s %lx %x:%x %lu",
-                   &start, &end, perms, &offset, &dev_major, &dev_minor, &inode) < 7)
-            continue;
-        if (target >= start && target < end) {
-            map_inode = inode;
-            found_region = true;
-            break;
-        }
-    }
-    fclose(fp);
-
-    if (!found_region || map_inode == 0)
-        return -1;
-
-    DIR *dir = opendir("/proc/self/fd");
-    if (!dir)
-        return -1;
-
-    struct dirent *ent;
-    while ((ent = readdir(dir)) != NULL) {
-        if (ent->d_name[0] == '.')
-            continue;
-        int candidate = atoi(ent->d_name);
-        struct stat st;
-        if (fstat(candidate, &st) == 0 && st.st_ino == (ino_t)map_inode) {
-            closedir(dir);
-            return candidate;
-        }
-    }
-    closedir(dir);
-    return -1;
-}
 
 static int collect_dmabufs(struct consumer_state *s)
 {
@@ -122,32 +88,41 @@ static int collect_dmabufs(struct consumer_state *s)
     int target = s->buf_count;
     int found = 0;
 
-    LOGI("collecting %d dma-bufs via lock/post", target);
+    LOGI("collecting %d dma-bufs via dequeue/queue", target);
 
     for (int attempt = 0; attempt < target * 4 && found < target; attempt++) {
-        ANativeWindow_Buffer buf;
-        if (ANativeWindow_lock(win, &buf, NULL) != 0) {
-            LOGE("ANativeWindow_lock failed on attempt %d", attempt);
+        ANativeWindowBuffer *anb = NULL;
+        int fence = -1;
+        if (api.dequeueBuffer(win, &anb, &fence) != 0 || !anb) {
+            LOGE("dequeueBuffer failed on attempt %d", attempt);
+            if (fence >= 0)
+                close(fence);
             break;
         }
+        if (fence >= 0)
+            close(fence);   /* enumeration only: no need to wait the fence */
 
-        void *bits = buf.bits;
-        int fd = fd_from_maps(bits);
-        ANativeWindow_unlockAndPost(win);
-
-        if (fd < 0) {
-            LOGE("fd_from_maps returned -1 on attempt %d", attempt);
+        if (!anb->handle || anb->handle->numFds < 1) {
+            LOGE("dequeued buffer has no dma-buf handle on attempt %d", attempt);
+            api.cancelBuffer(win, anb, -1);
             continue;
         }
 
-        /* deduplicate by bits pointer (stable across lock cycles) */
+        int fd = anb->handle->data[0];   /* first fd backs the dma-buf */
+        int stride = anb->stride, width = anb->width, height = anb->height;
+
+        /* deduplicate by ANativeWindowBuffer pointer (stable per queue slot) */
         bool dup_found = false;
         for (int i = 0; i < found; i++) {
-            if (s->buf_bits[i] == bits) {
+            if (s->buf_anb[i] == anb) {
                 dup_found = true;
                 break;
             }
         }
+
+        /* post it back so the next dequeue rotates to another slot */
+        api.queueBuffer(win, anb, -1);
+
         if (dup_found)
             continue;
 
@@ -155,14 +130,16 @@ static int collect_dmabufs(struct consumer_state *s)
         if (dup_fd < 0)
             continue;
 
-        s->buf_bits[found] = bits;
+        s->buf_anb[found] = anb;
         s->dmabuf_fds[found] = dup_fd;
-        s->dmabuf_infos[found].stride = buf.stride * 4;
+        s->dmabuf_infos[found].stride = stride * 4;
+        s->dmabuf_infos[found].width  = width;
+        s->dmabuf_infos[found].height = height;
         s->dmabuf_infos[found].format = PIXEL_FORMAT_RGBA_8888;
         s->dmabuf_infos[found].modifier = 0;
         s->dmabuf_infos[found].offset = 0;
-        LOGI("  buf[%d]: bits=%p fd=%d dup=%d %dx%d stride=%d",
-             found, bits, fd, dup_fd, buf.width, buf.height, buf.stride);
+        LOGI("  buf[%d]: anb=%p fd=%d dup=%d %dx%d stride=%d",
+             found, (void *)anb, fd, dup_fd, width, height, stride);
         found++;
     }
 
@@ -191,9 +168,198 @@ static void cleanup_dmabufs(struct consumer_state *s)
     s->buf_count = 0;
 }
 
+/* Report the current display refresh rate to the producer over the data
+ * channel, reusing the InputEvent framing (see INPUT_TYPE_DISPLAY_REFRESH).
+ * No-op when disconnected or rate unknown. */
+static void send_refresh_rate(struct consumer_state *s)
+{
+    if (!s->ctx || s->refresh_mhz == 0)
+        return;
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_DISPLAY_REFRESH,
+        .display = { .refresh_mhz = s->refresh_mhz },
+    };
+    push_input_event(s->ctx, &ev);
+}
+
+/*
+ * Event thread: listens for output events (clipboard, etc.) from the producer
+ * on the data_fd. Runs while s->event_running is true.
+ */
+static void *event_thread_func(void *arg)
+{
+    struct consumer_state *s = arg;
+    LOGI("event thread started");
+
+    JNIEnv *env = NULL;
+    if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
+        LOGE("event thread: AttachCurrentThread failed");
+        return NULL;
+    }
+
+    /* Find classes/methods once */
+    jclass ctxClass = (*env)->GetObjectClass(env, g_activity_obj);
+    jmethodID setClipMethod = (*env)->GetMethodID(env, ctxClass, "nativeSetClipboardText", "(Ljava/lang/String;)V");
+    if (!setClipMethod) {
+        LOGE("event thread: nativeSetClipboardText not found");
+        (*g_jvm)->DetachCurrentThread(g_jvm);
+        return NULL;
+    }
+
+    while (s->event_running) {
+        if (!s->ctx) {
+            usleep(50000);
+            continue;
+        }
+
+        struct OutputEvent ev;
+        int ret = poll_output_event(s->ctx, &ev, 500);
+        if (ret <= 0)
+            continue;
+
+        if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
+            char *buf = malloc(ev.clipboard.size + 1);
+            if (!buf)
+                continue;
+
+            if (poll_output_event_extend_data(s->ctx, buf, ev.clipboard.size, 5000) == 1) {
+                buf[ev.clipboard.size] = '\0';
+                jstring jstr = (*env)->NewStringUTF(env, buf);
+                if (jstr) {
+                    (*env)->CallVoidMethod(env, g_activity_obj, setClipMethod, jstr);
+                    (*env)->DeleteLocalRef(env, jstr);
+                }
+            }
+            free(buf);
+        } else {
+            /* Unknown or zero-length event: drain any trailing data if size > 0 */
+            LOGI("event thread: unknown output event type=%u size=%u", ev.type, ev.clipboard.size);
+        }
+    }
+
+    (*g_jvm)->DetachCurrentThread(g_jvm);
+    LOGI("event thread stopped");
+    return NULL;
+}
+
+static void start_event_thread(struct consumer_state *s)
+{
+    if (s->event_running)
+        return;
+    s->event_running = true;
+    pthread_create(&s->event_thread, NULL, event_thread_func, s);
+}
+
+static void stop_event_thread(struct consumer_state *s)
+{
+    if (!s->event_running)
+        return;
+    s->event_running = false;
+    //pthread_join(s->event_thread, NULL);
+}
+
+/*
+ * "Connect with root" handshake. The app cannot connect() to a root-owned
+ * daemon socket directly, so it listens on a bridge socket, launches the bundled
+ * helper through `su -c`, and the helper (as root) connects to the daemon and
+ * passes the connected fd back over the bridge. Returns the received fd (caller
+ * owns it) or -1 on failure.
+ */
+static int recv_fd_via_root_helper(const char *daemon_sock,
+                                   const char *helper_path,
+                                   const char *bridge_path)
+{
+    if (helper_path[0] == '\0' || bridge_path[0] == '\0') {
+        LOGE("root helper: helper/bridge path not configured");
+        return -1;
+    }
+
+    unlink(bridge_path);
+
+    int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
+    if (lfd < 0) {
+        LOGE("root helper: socket() failed: %s", strerror(errno));
+        return -1;
+    }
+
+    struct sockaddr_un addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sun_family = AF_UNIX;
+    strncpy(addr.sun_path, bridge_path, sizeof(addr.sun_path) - 1);
+
+    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+        LOGE("root helper: bind(%s) failed: %s", bridge_path, strerror(errno));
+        close(lfd);
+        return -1;
+    }
+    /* Root helper runs in a different SELinux/uid context; make the socket file
+     * reachable. (Root bypasses DAC, but be permissive anyway.) */
+    chmod(bridge_path, 0777);
+
+    if (listen(lfd, 1) < 0) {
+        LOGE("root helper: listen() failed: %s", strerror(errno));
+        close(lfd);
+        unlink(bridge_path);
+        return -1;
+    }
+
+    /* Build the command su runs: "<helper> <daemon_sock> <bridge_path>". */
+    char inner[1100];
+    snprintf(inner, sizeof(inner), "%s %s %s",
+             helper_path, daemon_sock, bridge_path);
+
+    pid_t pid = fork();
+    if (pid < 0) {
+        LOGE("root helper: fork() failed: %s", strerror(errno));
+        close(lfd);
+        unlink(bridge_path);
+        return -1;
+    }
+    if (pid == 0) {
+        execlp("su", "su", "-c", inner, (char *)NULL);
+        _exit(127);   /* su not found / exec failed */
+    }
+
+    /* Wait for the helper to connect (root prompt may take a while). */
+    int fd = -1;
+    struct pollfd pfd = { .fd = lfd, .events = POLLIN };
+    if (poll(&pfd, 1, 30000) > 0 && (pfd.revents & POLLIN)) {
+        int cfd = accept(lfd, NULL, NULL);
+        if (cfd >= 0) {
+            char b;
+            int got = 0;
+            if (recv_fds(cfd, &b, 1, &fd, 1, &got) < 0 || got < 1)
+                fd = -1;
+            close(cfd);
+        }
+    } else {
+        LOGE("root helper: timed out waiting for helper connection");
+    }
+
+    int status = 0;
+    waitpid(pid, &status, 0);
+    close(lfd);
+    unlink(bridge_path);
+
+    if (fd < 0)
+        LOGE("root helper: did not receive daemon fd (su status=%d)", status);
+    return fd;
+}
+
 static int do_connect(struct consumer_state *s)
 {
-    const char *sock = s->socket_path[0] ? s->socket_path : DEFAULT_SOCKET_PATH;
+    /* Snapshot the connection config for this attempt. */
+    pthread_mutex_lock(&cfg_lock);
+    bool use_root = cfg_use_root;
+    char sock_path[sizeof(cfg_socket_path)];
+    char helper_path[sizeof(cfg_helper_path)];
+    char bridge_path[sizeof(cfg_bridge_path)];
+    memcpy(sock_path, cfg_socket_path, sizeof(sock_path));
+    memcpy(helper_path, cfg_helper_path, sizeof(helper_path));
+    memcpy(bridge_path, cfg_bridge_path, sizeof(bridge_path));
+    pthread_mutex_unlock(&cfg_lock);
+
+    const char *sock = sock_path;
 
     if (s->ctx) {
         disconnect(s->ctx);
@@ -204,6 +370,14 @@ static int do_connect(struct consumer_state *s)
     ANativeWindow *win = s->window;
     s->screen_w = ANativeWindow_getWidth(win);
     s->screen_h = ANativeWindow_getHeight(win);
+
+    /* dequeueBuffer needs the window connected to an API first (ANativeWindow_lock
+     * did this internally). Disconnect first so reconnect is idempotent. */
+    anw_api_disconnect(win, ANW_API_CPU);
+    if (anw_api_connect(win, ANW_API_CPU) != 0) {
+        LOGE("api_connect(CPU) failed");
+        return -1;
+    }
 
     ANativeWindow_setBuffersGeometry(win, s->screen_w, s->screen_h,
                                      AHARDWAREBUFFER_FORMAT_R8G8B8A8_UNORM);
@@ -220,17 +394,30 @@ static int do_connect(struct consumer_state *s)
     if (collect_dmabufs(s) < 0)
         return -1;
 
-    LOGI("connecting to %s (%dx%d, %d bufs)", sock,
-         s->screen_w, s->screen_h, s->buf_count);
+    LOGI("connecting to %s (%dx%d, %d bufs, root=%d)", sock,
+         s->screen_w, s->screen_h, s->buf_count, use_root);
 
-    if (connect_to_deamon(&s->ctx, sock) < 0) {
+    if (use_root) {
+        int ctrl_fd = recv_fd_via_root_helper(sock, helper_path, bridge_path);
+        if (ctrl_fd < 0) {
+            LOGE("root helper connect failed");
+            return -1;
+        }
+        if (connect_to_deamon_with_fd(&s->ctx, ctrl_fd) < 0) {
+            LOGE("connect_to_deamon_with_fd failed");
+            return -1;
+        }
+    } else if (connect_to_deamon(&s->ctx, sock) < 0) {
         LOGE("connect_to_deamon failed");
         return -1;
     }
 
     set_screen_info(s->ctx, s->screen_w, s->screen_h,
-                    PIXEL_FORMAT_RGBA_8888, 0);
+                    PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
     push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
+
+    set_fallback_callback(s->ctx, on_fallback, s);
+    set_exit_fallback_callback(s->ctx, on_exit_fallback, s);
 
     s->need_reconnect = false;
     LOGI("connected");
@@ -241,7 +428,55 @@ static void on_fallback(void *userdata)
 {
     struct consumer_state *s = userdata;
     LOGI("fallback triggered");
-    s->need_reconnect = true;
+
+    // Disable clip listener on Java side before stopping event thread
+    if (g_jvm && g_activity_obj) {
+        JNIEnv *env = NULL;
+        bool attached = false;
+        if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+            if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) == 0)
+                attached = true;
+        }
+        if (env) {
+            jclass cls = (*env)->GetObjectClass(env, g_activity_obj);
+            jmethodID mid = (*env)->GetMethodID(env, cls, "nativeClipListening", "(Z)V");
+            if (mid)
+                (*env)->CallVoidMethod(env, g_activity_obj, mid, JNI_FALSE);
+        }
+        if (attached)
+            (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+
+    stop_event_thread(s);
+}
+
+static void on_exit_fallback(void *userdata)
+{
+    struct consumer_state *s = userdata;
+    LOGI("exit fallback triggered");
+
+    send_refresh_rate(&g_state);
+    
+    JNIEnv *env = NULL;
+    if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) != 0) {
+        LOGE("on_exit_fallback: AttachCurrentThread failed");
+        return;
+    }
+
+    // Enable clip listener on Java side
+    jclass cls = (*env)->GetObjectClass(env, g_activity_obj);
+    jmethodID listenMid = (*env)->GetMethodID(env, cls, "nativeClipListening", "(Z)V");
+    if (listenMid)
+        (*env)->CallVoidMethod(env, g_activity_obj, listenMid, JNI_TRUE);
+
+    start_event_thread(s);
+
+    // Initial clipboard sync: read current system clipboard and send to producer
+    jmethodID syncMethod = (*env)->GetMethodID(env, cls, "nativeClipboardSync", "()V");
+    if (syncMethod)
+        (*env)->CallVoidMethod(env, g_activity_obj, syncMethod);
+
+    (*g_jvm)->DetachCurrentThread(g_jvm);
 }
 
 static void *render_thread_func(void *arg)
@@ -256,41 +491,49 @@ static void *render_thread_func(void *arg)
                 usleep(500000);
                 continue;
             }
-            set_fallback_callback(s->ctx, on_fallback, s);
         }
 
-        if (!s->ctx) {
-            usleep(100000);
-            continue;
-        }
-
-        ANativeWindow_Buffer buf;
-        if (ANativeWindow_lock(s->window, &buf, NULL) != 0) {
+        ANativeWindowBuffer *anb = NULL;
+        int acqfence = -1;
+        if (api.dequeueBuffer(s->window, &anb, &acqfence) != 0 || !anb) {
             usleep(16000);
             continue;
+        }
+        /* Emulate ANativeWindow_lock: CPU-wait the acquire fence so the buffer is
+         * already safe to write (SurfaceFlinger done reading the previous frame)
+         * before we hand it to the producer. A sync_file fd signals POLLIN. */
+        if (acqfence >= 0) {
+            struct pollfd fpfd = { .fd = acqfence, .events = POLLIN };
+            poll(&fpfd, 1, 1000);
+            close(acqfence);
         }
 
         int idx = -1;
         for (int i = 0; i < s->buf_count; i++) {
-            if (s->buf_bits[i] == buf.bits) {
+            if (s->buf_anb[i] == anb) {
                 idx = i;
                 break;
             }
         }
 
         if (idx < 0) {
-            ANativeWindow_unlockAndPost(s->window);
+            api.queueBuffer(s->window, anb, -1);
             usleep(16000);
             continue;
         }
 
-        if (select_dmabuf(s->ctx, idx) < 0 || refresh_done(s->ctx) < 0) {
-            ANativeWindow_unlockAndPost(s->window);
+        if (select_dmabuf(s->ctx, idx) < 0) {
+            api.queueBuffer(s->window, anb, -1);
             usleep(16000);
             continue;
         }
 
-        ANativeWindow_unlockAndPost(s->window);
+        /* The producer renders into the buffer and hands back a render-done fence
+         * over data_fd (reverse). Queue with it so SurfaceFlinger waits GPU-side
+         * before scanout -- this lets the producer submit before its GPU render
+         * completes (no glFinish stall). rfence == -1 falls back to "ready now". */
+        int rfence = refresh_done(s->ctx);
+        api.queueBuffer(s->window, anb, rfence);
     }
 
     LOGI("render thread stopped");
@@ -299,9 +542,44 @@ static void *render_thread_func(void *arg)
 
 /* ---------- JNI ---------- */
 
+static void copy_jstring(JNIEnv *env, jstring js, char *dst, size_t dstsz)
+{
+    if (!js) {
+        dst[0] = '\0';
+        return;
+    }
+    const char *s = (*env)->GetStringUTFChars(env, js, NULL);
+    if (s) {
+        strncpy(dst, s, dstsz - 1);
+        dst[dstsz - 1] = '\0';
+        (*env)->ReleaseStringUTFChars(env, js, s);
+    } else {
+        dst[0] = '\0';
+    }
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeConfigure(
+    JNIEnv *env, jobject thiz, jstring socketPath, jboolean useRoot,
+    jstring helperPath, jstring bridgePath)
+{
+    pthread_mutex_lock(&cfg_lock);
+    char tmp[sizeof(cfg_socket_path)];
+    copy_jstring(env, socketPath, tmp, sizeof(tmp));
+    if (tmp[0] != '\0')
+        memcpy(cfg_socket_path, tmp, sizeof(cfg_socket_path));
+    cfg_use_root = (useRoot == JNI_TRUE);
+    copy_jstring(env, helperPath, cfg_helper_path, sizeof(cfg_helper_path));
+    copy_jstring(env, bridgePath, cfg_bridge_path, sizeof(cfg_bridge_path));
+    pthread_mutex_unlock(&cfg_lock);
+
+    LOGI("configured: socket=%s root=%d helper=%s bridge=%s",
+         cfg_socket_path, cfg_use_root, cfg_helper_path, cfg_bridge_path);
+}
+
 JNIEXPORT void JNICALL
 Java_com_anland_termux_MainActivity_nativeStart(
-    JNIEnv *env, jobject thiz, jobject surface, jstring socket_path)
+    JNIEnv *env, jobject thiz, jobject surface)
 {
     if (!api_loaded) {
         if (anw_api_load(&api) < 0) {
@@ -312,14 +590,6 @@ Java_com_anland_termux_MainActivity_nativeStart(
     }
 
     pthread_mutex_lock(&g_state.lock);
-
-    const char *path = socket_path ? (*env)->GetStringUTFChars(env, socket_path, NULL) : NULL;
-    if (path && path[0])
-        snprintf(g_state.socket_path, sizeof(g_state.socket_path), "%s", path);
-    else
-        snprintf(g_state.socket_path, sizeof(g_state.socket_path), "%s", DEFAULT_SOCKET_PATH);
-    if (path)
-        (*env)->ReleaseStringUTFChars(env, socket_path, path);
 
     if (g_state.running) {
         g_state.running = false;
@@ -348,6 +618,15 @@ Java_com_anland_termux_MainActivity_nativeStart(
         return;
     }
 
+    /* Save JVM & activity refs for event-thread JNI callbacks. */
+    if (!g_jvm) {
+        (*env)->GetJavaVM(env, &g_jvm);
+    }
+    if (g_activity_obj) {
+        (*env)->DeleteGlobalRef(env, g_activity_obj);
+    }
+    g_activity_obj = (*env)->NewGlobalRef(env, thiz);
+
     g_state.running = true;
     g_state.need_reconnect = true;
     pthread_create(&g_state.render_thread, NULL, render_thread_func, &g_state);
@@ -369,9 +648,29 @@ Java_com_anland_termux_MainActivity_nativeStop(
     }
 
     if (g_state.ctx) {
+        stop_event_thread(&g_state);
         disconnect(g_state.ctx);
         g_state.ctx = NULL;
     }
+
+    // Disable clip listener on Java side
+    if (g_jvm && g_activity_obj) {
+        JNIEnv *env = NULL;
+        bool attached = false;
+        if ((*g_jvm)->GetEnv(g_jvm, (void **)&env, JNI_VERSION_1_6) == JNI_EDETACHED) {
+            if ((*g_jvm)->AttachCurrentThread(g_jvm, &env, NULL) == 0)
+                attached = true;
+        }
+        if (env) {
+            jclass cls = (*env)->GetObjectClass(env, g_activity_obj);
+            jmethodID mid = (*env)->GetMethodID(env, cls, "nativeClipListening", "(Z)V");
+            if (mid)
+                (*env)->CallVoidMethod(env, g_activity_obj, mid, JNI_FALSE);
+        }
+        if (attached)
+            (*g_jvm)->DetachCurrentThread(g_jvm);
+    }
+
     cleanup_dmabufs(&g_state);
 
     if (g_state.window) {
@@ -380,6 +679,17 @@ Java_com_anland_termux_MainActivity_nativeStop(
     }
 
     pthread_mutex_unlock(&g_state.lock);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeSetRefreshRate(
+    JNIEnv *env, jobject thiz, jfloat hz)
+{
+    if (hz <= 0.0f)
+        return;
+    g_state.refresh_mhz = (uint32_t)(hz * 1000.0f + 0.5f);
+    // Apply live if already connected; otherwise do_connect() seeds it.
+    send_refresh_rate(&g_state);
 }
 
 JNIEXPORT void JNICALL
@@ -467,4 +777,52 @@ Java_com_anland_termux_MainActivity_nativeSendMouseScroll(
         .pointer_axis = { .axis = axis, .value = value, .discrete = 0 },
     };
     push_input_event(g_state.ctx, &ev);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeSendClipboard(
+    JNIEnv *env, jobject thiz, jbyteArray data)
+{
+    if (!g_state.ctx)
+        return;
+
+    jsize len = (*env)->GetArrayLength(env, data);
+    if (len <= 0)
+        return;
+
+    char *buf = malloc(len);
+    if (!buf)
+        return;
+    (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_CLIPBOARD,
+        .clipboard = { .size = (uint32_t)len },
+    };
+    push_input_event_with_length(g_state.ctx, &ev, buf, len);
+    free(buf);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeSendTextInput(
+    JNIEnv *env, jobject thiz, jbyteArray data)
+{
+    if (!g_state.ctx)
+        return;
+
+    jsize len = (*env)->GetArrayLength(env, data);
+    if (len <= 0)
+        return;
+
+    char *buf = malloc(len);
+    if (!buf)
+        return;
+    (*env)->GetByteArrayRegion(env, data, 0, len, (jbyte *)buf);
+
+    struct InputEvent ev = {
+        .type = INPUT_TYPE_TEXT_INPUT,
+        .text_input = { .size = (uint32_t)len },
+    };
+    push_input_event_with_length(g_state.ctx, &ev, buf, len);
+    free(buf);
 }

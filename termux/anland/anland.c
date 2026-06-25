@@ -15,8 +15,6 @@
 
 #define MAX_EVENTS 16
 #define MAX_FDS    4
-#define DEFAULT_TERMUX_TMP "/data/data/com.termux/files/usr/tmp"
-#define DEFAULT_SOCKET_RELATIVE "anland/display_daemon.sock"
 
 struct client {
     int  ctrl_fd;
@@ -36,6 +34,62 @@ static int deposited_fd_count;
 
 static bool producer_waiting_screen;
 static bool producer_waiting_fds;
+
+static const char *default_socket_path(void)
+{
+    static char path[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    const char *tmpdir = getenv("TMPDIR");
+
+    if (!tmpdir || tmpdir[0] == '\0')
+        tmpdir = "/data/data/com.termux/files/usr/tmp";
+
+    if (snprintf(path, sizeof(path), "%s/anland/display_daemon.sock", tmpdir) >=
+        (int)sizeof(path)) {
+        fprintf(stderr, "daemon: default socket path is too long\n");
+        exit(1);
+    }
+
+    return path;
+}
+
+static const char *parse_socket_path(int argc, char **argv)
+{
+    if (argc <= 1)
+        return default_socket_path();
+    if (strcmp(argv[1], "--socket") == 0) {
+        if (argc < 3 || argv[2][0] == '\0') {
+            fprintf(stderr, "usage: anland [--socket PATH] [PATH]\n");
+            exit(1);
+        }
+        return argv[2];
+    }
+    return argv[1];
+}
+
+static int ensure_socket_parent(const char *sock_path)
+{
+    char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
+    char *slash;
+
+    if (strlen(sock_path) >= sizeof(dir)) {
+        fprintf(stderr, "daemon: socket path is too long\n");
+        return -1;
+    }
+
+    strcpy(dir, sock_path);
+    slash = strrchr(dir, '/');
+    if (!slash)
+        return 0;
+    *slash = '\0';
+    if (dir[0] == '\0')
+        return 0;
+
+    if (mkdir(dir, 0700) < 0 && errno != EEXIST) {
+        perror("mkdir");
+        return -1;
+    }
+    return 0;
+}
 
 static void handle_signal(int sig)
 {
@@ -101,19 +155,33 @@ static void try_deliver_fds(void)
     fprintf(stderr, "daemon: fds delivered to producer\n");
 }
 
-static void handle_disconnect(struct client *c)
+/*
+ * Tear down whichever role this client holds, reset the associated state, then free
+ * it. Used both for real disconnects (EPOLLHUP / recv error) and to evict a stale
+ * client when a new one takes over the same role -- whether the old client is still
+ * alive or already a ghost, finding one is reason enough to drop it.
+ *
+ * The role pointer is cleared BEFORE client_free() so that any event still queued for
+ * this client in the current epoll batch fails the "is it a current role?" guard in
+ * the main loop and is skipped instead of dereferencing freed memory.
+ */
+static void drop_client(struct client *c)
 {
+    if (!c)
+        return;
     if (c == consumer) {
         fprintf(stderr, "daemon: consumer disconnected\n");
-        client_free(consumer);
         consumer = NULL;
+        /* The deposited fds belong to the consumer that just left; a future producer
+         * must never be handed this stale set. Drop them together with the consumer. */
+        clear_deposited_fds();
     } else if (c == producer) {
         fprintf(stderr, "daemon: producer disconnected\n");
-        client_free(producer);
         producer = NULL;
         producer_waiting_screen = false;
         producer_waiting_fds = false;
     }
+    client_free(c);
 }
 
 static void handle_client_data(struct client *c)
@@ -124,14 +192,14 @@ static void handle_client_data(struct client *c)
 
     int n = recv_fds(c->ctrl_fd, &hdr, sizeof(hdr), fds, MAX_FDS, &fd_count);
     if (n <= 0) {
-        handle_disconnect(c);
+        drop_client(c);
         return;
     }
 
     uint8_t payload[sizeof(struct screen_info)];
     if (hdr.size > 0) {
         if (hdr.size > sizeof(payload) || recv_all(c->ctrl_fd, payload, hdr.size) < 0) {
-            handle_disconnect(c);
+            drop_client(c);
             return;
         }
     }
@@ -152,19 +220,13 @@ static void handle_client_data(struct client *c)
         if (c == consumer && hdr.size == sizeof(struct screen_info)) {
             struct screen_info si;
             memcpy(&si, payload, sizeof(si));
-            if (has_screen_info) {
-                if (memcmp(&si, &stored_screen, sizeof(si)) != 0) {
-                    fprintf(stderr, "daemon: rejecting consumer (screen info mismatch)\n");
-                    send_ctrl(c->ctrl_fd, CTRL_MSG_REJECT);
-                    handle_disconnect(c);
-                    return;
-                }
-            } else {
-                stored_screen = si;
-                has_screen_info = true;
-                fprintf(stderr, "daemon: screen info %ux%u fmt=%u\n",
-                        si.width, si.height, si.format);
-            }
+            /* Always accept the consumer's screen info, even if it differs from a
+             * previous connection — the Android display may have rotated or switched
+             * resolution. Overwrite and forward to any waiting producer. */
+            stored_screen = si;
+            has_screen_info = true;
+            fprintf(stderr, "daemon: screen info %ux%u fmt=%u\n",
+                    si.width, si.height, si.format);
             if (producer_waiting_screen && producer) {
                 send_screen_info_msg(producer->ctrl_fd);
                 producer_waiting_screen = false;
@@ -202,8 +264,10 @@ static void handle_new_connection(int listen_fd)
     c->ctrl_fd = client_fd;
 
     if (hdr.type == CTRL_MSG_CONSUMER_HELLO) {
+        /* Evict any prior consumer (alive or ghost) and its stale deposit before this
+         * one takes over the role. */
         if (consumer)
-            client_free(consumer);
+            drop_client(consumer);
         c->is_consumer = true;
         consumer = c;
 
@@ -216,8 +280,9 @@ static void handle_new_connection(int listen_fd)
             try_deliver_fds();
 
     } else if (hdr.type == CTRL_MSG_PRODUCER_HELLO) {
+        /* Evict any prior producer (alive or ghost) before this one takes over. */
         if (producer)
-            client_free(producer);
+            drop_client(producer);
         c->is_consumer = false;
         producer = c;
         producer_waiting_screen = false;
@@ -239,101 +304,16 @@ static void handle_new_connection(int listen_fd)
     epoll_ctl(epoll_fd, EPOLL_CTL_ADD, client_fd, &ev);
 }
 
-static int mkdir_p(const char *path)
-{
-    char tmp[4096];
-    size_t len = strlen(path);
-    if (len == 0 || len >= sizeof(tmp)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    memcpy(tmp, path, len + 1);
-    if (tmp[len - 1] == '/')
-        tmp[len - 1] = '\0';
-
-    for (char *p = tmp + 1; *p; p++) {
-        if (*p != '/')
-            continue;
-        *p = '\0';
-        if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
-            return -1;
-        *p = '/';
-    }
-
-    if (mkdir(tmp, 0700) < 0 && errno != EEXIST)
-        return -1;
-    return 0;
-}
-
-static int ensure_parent_dir(const char *sock_path)
-{
-    char dir[4096];
-    size_t len = strlen(sock_path);
-    if (len == 0 || len >= sizeof(dir)) {
-        errno = ENAMETOOLONG;
-        return -1;
-    }
-
-    memcpy(dir, sock_path, len + 1);
-    char *slash = strrchr(dir, '/');
-    if (!slash)
-        return 0;
-    if (slash == dir)
-        return 0;
-    *slash = '\0';
-    return mkdir_p(dir);
-}
-
-static const char *default_socket_path(char *buf, size_t size)
-{
-    const char *tmpdir = getenv("TMPDIR");
-    if (!tmpdir || !tmpdir[0])
-        tmpdir = DEFAULT_TERMUX_TMP;
-
-    if (snprintf(buf, size, "%s/%s", tmpdir, DEFAULT_SOCKET_RELATIVE) >= (int)size) {
-        errno = ENAMETOOLONG;
-        return NULL;
-    }
-    return buf;
-}
-
-static const char *resolve_socket_path(int argc, char **argv, char *buf, size_t size)
-{
-    if (argc > 1) {
-        if (strcmp(argv[1], "--socket") == 0) {
-            if (argc < 3) {
-                fprintf(stderr, "usage: anland [--socket PATH] [PATH]\n");
-                return NULL;
-            }
-            return argv[2];
-        }
-        return argv[1];
-    }
-
-    return default_socket_path(buf, size);
-}
-
 int main(int argc, char **argv)
 {
-    char default_path[4096];
-    const char *sock_path = resolve_socket_path(argc, argv, default_path, sizeof(default_path));
-    if (!sock_path)
-        return 1;
-
-    if (strlen(sock_path) >= sizeof(((struct sockaddr_un *)0)->sun_path)) {
-        fprintf(stderr, "anland: socket path too long for AF_UNIX: %s\n", sock_path);
-        return 1;
-    }
-
-    if (ensure_parent_dir(sock_path) < 0) {
-        perror("mkdir socket directory");
-        return 1;
-    }
+    const char *sock_path = parse_socket_path(argc, argv);
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
     signal(SIGPIPE, SIG_IGN);
+
+    if (ensure_socket_parent(sock_path) < 0)
+        return 1;
 
     unlink(sock_path);
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -345,6 +325,10 @@ int main(int argc, char **argv)
     struct sockaddr_un addr;
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
+    if (strlen(sock_path) >= sizeof(addr.sun_path)) {
+        fprintf(stderr, "daemon: socket path is too long\n");
+        return 1;
+    }
     memcpy(addr.sun_path, sock_path, strlen(sock_path) + 1);
 
     if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
@@ -370,8 +354,14 @@ int main(int argc, char **argv)
                 handle_new_connection(listen_fd);
             } else {
                 struct client *c = events[i].data.ptr;
+                /* A client freed earlier in this same batch -- a real disconnect, or
+                 * one evicted by a new connection taking over its role -- leaves a
+                 * stale event behind. Skip anything that is no longer a current role
+                 * so we never touch freed memory. */
+                if (c != consumer && c != producer)
+                    continue;
                 if (events[i].events & (EPOLLHUP | EPOLLERR))
-                    handle_disconnect(c);
+                    drop_client(c);
                 else
                     handle_client_data(c);
             }
