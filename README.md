@@ -1,11 +1,11 @@
 # Anland: Termux
 
 Use [Anland](https://github.com/superturtlee/anland) in Termux, including
-Termux native producers and `proot-distro --shared-tmp` containers.
+Termux native producers and Chroot containers.
 
 ## Current Shape
 
-- Based on Anland 1.11
+- Based on Anland 4.1
 - Android app: `app/`
   - package: `com.anland.termux`
   - label: `Anland Termux`
@@ -14,9 +14,10 @@ Termux native producers and `proot-distro --shared-tmp` containers.
 - Termux command: `termux/anland/`
   - binary name: `anland`
   - default socket: `$TMPDIR/anland/display_daemon.sock`
-- Session helpers: `scripts/`
-  - `anland-native-session.sh`
-  - `anland-proot-session.sh`
+
+## Usage
+
+Please refer to the notes in the [Releases](https://github.com/lfdevs/anland-termux/releases).
 
 ## Build
 
@@ -59,32 +60,3 @@ The Termux package recipe draft lives at:
 ```text
 packages/anland/build.sh
 ```
-
-## Run With A Termux Native Producer
-
-Install the app, install/copy the `anland` command into Termux, then run:
-
-```sh
-anland-native-session weston --backend=anland-backend.so
-```
-
-Without a producer command, keep the daemon running and use another shell:
-
-```sh
-anland-native-session
-```
-
-## Run With PRoot
-
-```sh
-ANLAND_PROOT_DISTRO=debian anland-proot-session --user user
-```
-
-Inside the container:
-
-```sh
-export ANLAND_DISPLAY_SOCKET=/tmp/anland/display_daemon.sock
-weston --backend=anland-backend.so
-```
-
-The PRoot flow requires `--shared-tmp`; the helper applies it automatically.
