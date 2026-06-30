@@ -17,7 +17,9 @@
 #include <unistd.h>
 
 #include "anw_hidden.h"
+#include "camera_service.h"
 #include "display_consumer.h"
+#include "native_audio.h"
 #include "protocol.h"
 #include "socket_utils.h"
 
@@ -27,6 +29,9 @@
 
 #define PIXEL_FORMAT_RGBA_8888 1
 #define MAX_COLLECT_BUFS 8
+
+static int cfg_custom_width = 0;
+static int cfg_custom_height = 0;
 
 /* Saved JVM / activity reference for event-thread JNI callbacks. */
 static JavaVM *g_jvm = NULL;
@@ -72,8 +77,7 @@ static struct consumer_state g_state = {
 /* Connection config, set from Java via nativeConfigure() and read on each
  * (re)connect in do_connect(). Guarded by cfg_lock. */
 static pthread_mutex_t cfg_lock = PTHREAD_MUTEX_INITIALIZER;
-static char cfg_socket_path[256] =
-    "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
+static char cfg_socket_path[256] = "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
 static bool cfg_use_root = false;
 static char cfg_helper_path[512] = "";
 static char cfg_bridge_path[512] = "";
@@ -217,7 +221,12 @@ static void *event_thread_func(void *arg)
         if (ret <= 0)
             continue;
 
-        if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
+        if (ev.type == OUTPUT_TYPE_RESOURCES_REQUEST) {
+            /* Producer is asking for a service's fds (e.g. camera). The display lib
+             * matches the type against the registered services and sends the
+             * pre-created fds back over SCM_RIGHTS. */
+            handle_resource_request(s->ctx, &ev);
+        } else if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
             char *buf = malloc(ev.clipboard.size + 1);
             if (!buf)
                 continue;
@@ -362,14 +371,25 @@ static int do_connect(struct consumer_state *s)
     const char *sock = sock_path;
 
     if (s->ctx) {
+        audio_set_ctx(NULL);   /* detach audio before the old ctx (and its fd) dies */
         disconnect(s->ctx);
         s->ctx = NULL;
     }
     cleanup_dmabufs(s);
 
     ANativeWindow *win = s->window;
-    s->screen_w = ANativeWindow_getWidth(win);
-    s->screen_h = ANativeWindow_getHeight(win);
+    pthread_mutex_lock(&cfg_lock);
+    int cw = cfg_custom_width;
+    int ch = cfg_custom_height;
+    pthread_mutex_unlock(&cfg_lock);
+
+    if (cw > 0 && ch > 0) {
+        s->screen_w = cw;
+        s->screen_h = ch;
+    } else {
+       s->screen_w = ANativeWindow_getWidth(win);
+       s->screen_h = ANativeWindow_getHeight(win);
+    }
 
     /* dequeueBuffer needs the window connected to an API first (ANativeWindow_lock
      * did this internally). Disconnect first so reconnect is idempotent. */
@@ -416,8 +436,22 @@ static int do_connect(struct consumer_state *s)
                     PIXEL_FORMAT_RGBA_8888, s->refresh_mhz);
     push_dmabufs(s->ctx, s->dmabuf_fds, s->dmabuf_infos, s->buf_count);
 
+    /* Register the camera service only when it was initialised (i.e. the user
+     * enabled it in settings and granted CAMERA). allocate_services() stores this
+     * pointer by reference, so it must outlive the ctx -> keep it static. The
+     * producer drives it via RESOURCES_REQUEST (handled on the event thread). */
+    if (camera_service_is_ready()) {
+        static struct service_info camera_svc;
+        camera_svc.type = SERVICE_TYPE_CAMERA;
+        camera_svc.allocate_resource = camera_allocate_resource;
+        camera_svc.free_resource = camera_free_resource;
+        allocate_services(s->ctx, &camera_svc, 1);
+    }
+
     set_fallback_callback(s->ctx, on_fallback, s);
     set_exit_fallback_callback(s->ctx, on_exit_fallback, s);
+
+    audio_set_ctx(s->ctx);   /* audio fd is now live; threads pick it up via get_audio_fd */
 
     s->need_reconnect = false;
     LOGI("connected");
@@ -428,6 +462,8 @@ static void on_fallback(void *userdata)
 {
     struct consumer_state *s = userdata;
     LOGI("fallback triggered");
+
+    audio_set_ctx(NULL);   /* the lib has closed the audio fd; stop touching it */
 
     // Disable clip listener on Java side before stopping event thread
     if (g_jvm && g_activity_obj) {
@@ -578,6 +614,17 @@ Java_com_anland_termux_MainActivity_nativeConfigure(
 }
 
 JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeSetCustomResolution(
+    JNIEnv* env, jobject thiz, jint width, jint height)
+{
+    pthread_mutex_lock(&cfg_lock);
+    cfg_custom_width = width;
+    cfg_custom_height = height;
+    pthread_mutex_unlock(&cfg_lock);
+    LOGI("custom resolution: %dx%d", width, height);
+}
+
+JNIEXPORT void JNICALL
 Java_com_anland_termux_MainActivity_nativeStart(
     JNIEnv *env, jobject thiz, jobject surface)
 {
@@ -631,6 +678,10 @@ Java_com_anland_termux_MainActivity_nativeStart(
     g_state.need_reconnect = true;
     pthread_create(&g_state.render_thread, NULL, render_thread_func, &g_state);
 
+    /* Audio streams live independently of the connection; the render thread attaches
+     * the fd via audio_set_ctx() once connected. */
+    audio_start();
+
     pthread_mutex_unlock(&g_state.lock);
 }
 
@@ -646,6 +697,10 @@ Java_com_anland_termux_MainActivity_nativeStop(
         pthread_join(g_state.render_thread, NULL);
         pthread_mutex_lock(&g_state.lock);
     }
+
+    /* Stop audio before the ctx (and its fd) is torn down. */
+    audio_set_ctx(NULL);
+    audio_stop();
 
     if (g_state.ctx) {
         stop_event_thread(&g_state);
@@ -825,4 +880,18 @@ Java_com_anland_termux_MainActivity_nativeSendTextInput(
     };
     push_input_event_with_length(g_state.ctx, &ev, buf, len);
     free(buf);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeSetMicEnabled(
+    JNIEnv *env, jobject thiz, jboolean enabled)
+{
+    audio_set_mic_enabled(enabled == JNI_TRUE);
+}
+
+JNIEXPORT void JNICALL
+Java_com_anland_termux_MainActivity_nativeSetAudioLatency(
+    JNIEnv *env, jobject thiz, jint speakerMs, jint micMs)
+{
+    audio_set_latency(speakerMs, micMs);
 }

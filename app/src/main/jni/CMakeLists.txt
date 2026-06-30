@@ -5,6 +5,8 @@ set(ANLAND_CORE_DIR ${CMAKE_CURRENT_SOURCE_DIR}/anland_core)
 
 add_library(anland_consumer SHARED
     native_consumer.c
+    native_audio.c
+    camera_service.c
     ${ANLAND_CORE_DIR}/libdisplay_consumer/display_consumer.c
     ${ANLAND_CORE_DIR}/common/socket_utils.c
 )
@@ -21,6 +23,7 @@ target_link_libraries(anland_consumer
     android
     log
     dl
+    aaudio
 )
 
 add_executable(fdhelper
