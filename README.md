@@ -1,11 +1,11 @@
 # Anland: Termux
 
 Use [Anland](https://github.com/superturtlee/anland) in Termux, including
-Termux native producers and Chroot containers.
+Termux native producers and **PRoot/Chroot** containers.
 
 ## Current Shape
 
-- Based on Anland 4.1
+- Based on Anland
 - Android app: `app/`
   - package: `com.anland.termux`
   - label: `Anland Termux`

@@ -14,7 +14,7 @@ on:
       tag:
         description: 'Tag'
         required: true
-        default: 'anland-5.8-4_6.6.4-0ubuntu91'
+        default: 'anland-5.8-4_6.6.4-0ubuntu92'
 
 permissions:
   contents: write
