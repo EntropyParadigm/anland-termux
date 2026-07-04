@@ -24,8 +24,14 @@ target_link_libraries(anland_consumer
     log
     dl
     aaudio
+    camera2ndk
+    mediandk
 )
 
+# Root helper for "connect with root" mode. Built as an executable but named
+# lib*.so so the Android packager extracts it into the app's nativeLibraryDir
+# with execute permission (requires useLegacyPackaging=true). Launched by the
+# app via `su -c` to connect the daemon socket and pass the fd back.
 add_executable(fdhelper
     fd_helper.c
     ${ANLAND_CORE_DIR}/common/socket_utils.c
