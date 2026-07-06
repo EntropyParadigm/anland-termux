@@ -1,7 +1,6 @@
 # Anland: Termux
 
-Use [Anland](https://github.com/superturtlee/anland) in Termux, including
-Termux native producers and **PRoot/Chroot** containers.
+Use [Anland](https://github.com/superturtlee/anland) in Termux, including **Termux native** and **PRoot/Chroot/LXC** containers.
 
 ## Current Shape
 
