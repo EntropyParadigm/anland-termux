@@ -5,6 +5,7 @@
     <uses-permission android:name="android.permission.RECORD_AUDIO" />
     <uses-permission android:name="android.permission.MODIFY_AUDIO_SETTINGS" />
     <uses-permission android:name="android.permission.CAMERA" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
     <uses-feature android:name="android.hardware.camera.any" android:required="false" />
 
     <application
@@ -14,6 +15,7 @@
         <activity
             android:name=".MainActivity"
             android:configChanges="orientation|screenSize|screenLayout|smallestScreenSize|keyboardHidden"
+            android:enableOnBackInvokedCallback="false"
             android:exported="true"
             android:launchMode="singleTask">
             <property
@@ -29,6 +31,7 @@
         </activity>
         <activity
             android:name=".SettingsActivity"
+            android:enableOnBackInvokedCallback="false"
             android:exported="true"
             android:theme="@android:style/Theme.DeviceDefault.Light.NoActionBar">
             <intent-filter>
