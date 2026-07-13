@@ -1,5 +1,9 @@
 # Anland: Termux
 
+**English** | [中文](README_zh.md)
+
+---
+
 Use [Anland](https://github.com/superturtlee/anland) in Termux, including **Termux native** and **PRoot/Chroot/LXC** containers.
 
 ## Current Shape
@@ -14,17 +18,13 @@ Use [Anland](https://github.com/superturtlee/anland) in Termux, including **Term
   - binary name: `anland`
   - default socket: `$TMPDIR/anland/display_daemon.sock`
 
-## Usage
+## User Guide
 
-Please refer to the notes in the [Releases](https://github.com/lfdevs/anland-termux/releases).
+See [Anland: Termux User Guide](docs/user-guide.md).
 
 ## Build
 
-Build the Android app:
-
-```sh
-tools/build-app.sh
-```
+### Android Display App
 
 Requirements:
 
@@ -36,13 +36,21 @@ minSdk 30
 compileSdk 36
 ```
 
-Output:
+Build script:
+
+```sh
+tools/build-app.sh
+```
+
+Build artifact:
 
 ```text
 out/AnlandTermux-<version>.apk
 ```
 
-Build the `anland` daemon for the current system:
+### Anland Daemon
+
+Build script:
 
 ```sh
 tools/build-termux-anland.sh
@@ -54,8 +62,10 @@ When this is run inside Termux, the output is a Termux executable:
 out/anland
 ```
 
-The Termux package recipe draft lives at:
+The draft Termux package recipe is located at:
 
 ```text
 packages/anland/build.sh
 ```
+
+Related pull request: https://github.com/lfdevs/termux-packages/pull/11
