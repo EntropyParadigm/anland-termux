@@ -1,0 +1,47 @@
+{
+  "kwin": {
+    "description": "KDE window manager, Wayland version",
+    "distributions": {
+      "debian": {
+        "trixie": {
+            "arm64": "https://github.com/lfdevs/anland-termux/releases/download/5.13.0/kwin_anland-5.8-debian-4_6.3.6-92.zip"
+        }
+      },
+      "ubuntu": {
+        "resolute": {
+            "arm64": "https://github.com/lfdevs/anland-termux/releases/download/5.13.0/kwin_anland-5.8-4_6.6.4-0ubuntu92.zip"
+        }
+      }
+    }
+  },
+  "xwayland": {
+    "description": "X server for running X clients under Wayland",
+    "distributions": {
+      "debian": {
+        "trixie": {
+            "arm64": "https://github.com/lfdevs/anland-termux/releases/download/5.13.0/xwayland_24.1.6-91_arm64.deb"
+        }
+      },
+      "ubuntu": {
+        "resolute": {
+            "arm64": "https://github.com/lfdevs/anland-termux/releases/download/5.13.0/xwayland_24.1.10-91_arm64.deb"
+        }
+      }
+    }
+  },
+  "mesa": {
+    "description": "Mesa 3D graphics library",
+    "distributions": {
+      "debian": {
+        "trixie": {
+            "arm64": "https://github.com/lfdevs/mesa-for-android-container/releases/download/mesa-26.2.0-devel-20260709/mesa-for-android-container_26.2.0-devel-20260709_debian_trixie_arm64.tar.gz"
+        }
+      },
+      "ubuntu": {
+        "resolute": {
+            "arm64": "https://github.com/lfdevs/mesa-for-android-container/releases/download/mesa-26.2.0-devel-20260709/mesa-for-android-container_26.2.0-devel-20260709_ubuntu_resolute_arm64.tar.gz"
+        }
+      }
+    }
+  }
+}

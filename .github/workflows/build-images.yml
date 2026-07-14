@@ -1,0 +1,116 @@
+name: Build Docker Images
+
+on:
+  workflow_dispatch:
+    inputs:
+      distribution:
+        description: 'Linux Distribution'
+        required: true
+        default: 'Ubuntu 26.04'
+        type: choice
+        options:
+          - Debian 13
+          - Ubuntu 26.04
+
+env:
+  REGISTRY: ghcr.io
+
+permissions:
+  contents: read
+  packages: write
+  attestations: write
+  id-token: write
+
+jobs:
+  build-and-push-image:
+    runs-on: ubuntu-26.04-arm
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+
+      - name: Configure image build
+        id: config
+        env:
+          DISTRIBUTION: ${{ inputs.distribution }}
+        run: |
+          set -euo pipefail
+
+          case "$DISTRIBUTION" in
+            'Debian 13')
+              distribution=debian
+              version=trixie
+              dockerfile=images/debian.Dockerfile
+              image_name=debian
+              tag=trixie-anland-plasma
+              base_version_arg=DEBIAN_VERSION
+              ;;
+            'Ubuntu 26.04')
+              distribution=ubuntu
+              version=resolute
+              dockerfile=images/ubuntu.Dockerfile
+              image_name=ubuntu
+              tag=resolute-anland-plasma
+              base_version_arg=UBUNTU_VERSION
+              ;;
+            *)
+              echo "Unsupported distribution: $DISTRIBUTION" >&2
+              exit 1
+              ;;
+          esac
+
+          kwin_url=$(jq -er --arg distribution "$distribution" --arg version "$version" \
+            '.kwin.distributions[$distribution][$version].arm64' images/packages.json)
+          xwayland_url=$(jq -er --arg distribution "$distribution" --arg version "$version" \
+            '.xwayland.distributions[$distribution][$version].arm64' images/packages.json)
+          mesa_url=$(jq -er --arg distribution "$distribution" --arg version "$version" \
+            '.mesa.distributions[$distribution][$version].arm64' images/packages.json)
+
+          {
+            echo "dockerfile=$dockerfile"
+            echo "image_name=$image_name"
+            echo "tag=$tag"
+            echo "base_version_arg=$base_version_arg"
+            echo "base_version=$version"
+            echo "kwin_url=$kwin_url"
+            echo "xwayland_url=$xwayland_url"
+            echo "mesa_url=$mesa_url"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Log in to the Container registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.config.outputs.image_name }}
+          tags: |
+            type=raw,value=${{ steps.config.outputs.tag }}
+
+      - name: Build and push image
+        id: push
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: ${{ steps.config.outputs.dockerfile }}
+          platforms: linux/arm64
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          build-args: |
+            ${{ steps.config.outputs.base_version_arg }}=${{ steps.config.outputs.base_version }}
+            KWIN_URL=${{ steps.config.outputs.kwin_url }}
+            XWAYLAND_URL=${{ steps.config.outputs.xwayland_url }}
+            MESA_URL=${{ steps.config.outputs.mesa_url }}
+
+      - name: Generate artifact attestation
+        uses: actions/attest@v4
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/${{ steps.config.outputs.image_name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true
