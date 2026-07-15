@@ -6,6 +6,15 @@
 
 本文将逐步介绍 [Anland: Termux](https://github.com/lfdevs/anland-termux) 的下载、安装和使用方法。
 
+## 前提
+
+在安装 Anland: Termux 前，请先检查你现在安装的 Termux App 是否来自 [GitHub 的官方 Releases](https://github.com/termux/termux-app/releases)**（而非 F-Droid 或 Google Play）**。本项目仅支持与来自 GitHub 官方 Releases 的 Termux App 一同工作。如果你想将 Termux 迁移到 GitHub 版本，可以参考官方的备份与恢复指南：https://wiki.termux.com/wiki/Backing_up_Termux
+
+```sh
+# 在 Termux 运行这条命令，输出应为 'GITHUB'
+echo $TERMUX_APP__APK_RELEASE
+```
+
 ## 下载
 
 在[最新的 Release 说明](https://github.com/lfdevs/anland-termux/releases/latest) 中，我们重点关注“文件列表”一节。以下是一个示例：
@@ -36,6 +45,28 @@
    ```sh
    pkg reinstall ./anland_5.11.0-1_aarch64.deb
    ```
+
+> [!TIP]
+> 如果你接下来打算在 [PRoot-Distro](https://github.com/termux/proot-distro) 容器中使用 Anland，则可以直接使用本项目构建的系统镜像。安装方法如下：
+>
+> ```sh
+> pkg install proot-distro
+> # For Debian 13:
+> proot-distro install ghcr.io/lfdevs/debian:trixie-anland-plasma --name debian-anland
+> # For Ubuntu 26.04 LTS:
+> proot-distro install ghcr.io/lfdevs/ubuntu:resolute-anland-plasma --name ubuntu-anland
+> ```
+>
+> 使用方法如下。它将会启动 KDE Plasma 桌面，然后请切换到 Android 的“Anland Termux”应用。
+>
+> ```sh
+> killall anland > /dev/null 2>&1
+> anland > /dev/null 2>&1 &
+> # For Debian 13:
+> proot-distro login debian-anland --shared-tmp -- bash -c "startplasma-anland"
+> # For Ubuntu 26.04 LTS:
+> proot-distro login ubuntu-anland --shared-tmp -- bash -c "startplasma-anland"
+> ```
 
 3. 在实际运行环境中完成 KDE Plasma 桌面的安装后，使用软件包管理器安装 KWin 和 XWayland。**如果是 `.zip` 格式的压缩包，则需要先解压才能得到实际的安装包。**
 
