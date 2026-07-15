@@ -13,22 +13,35 @@ RUN set -eux; \
     : "${MESA_URL:?MESA_URL must be provided}"; \
     apt update; \
     apt install -y --no-install-recommends \
+        apt-transport-https \
+        bash-completion \
         ca-certificates \
         curl \
         dbus-x11 \
         dolphin \
+        kde-config-screenlocker \
         kde-plasma-desktop \
+        kde-spectacle \
+        kinfocenter \
         konsole \
+        kscreen \
         kwin-wayland \
+        kwrite \
         libegl-mesa0 \
         libgbm1 \
         libgl1-mesa-dri \
         libglx-mesa0 \
+        locales \
         mesa-libgallium \
         mesa-vulkan-drivers \
+        pipewire-audio \
+        plasma-pa \
         plasma-session-wayland \
+        plasma-systemmonitor \
         psmisc \
+        powerdevil \
         sudo \
+        systemsettings \
         unzip \
         xwayland; \
     curl --fail --location --show-error --output /tmp/xwayland.deb "${XWAYLAND_URL}"; \
