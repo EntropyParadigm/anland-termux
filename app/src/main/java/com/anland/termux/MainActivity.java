@@ -234,7 +234,12 @@ public class MainActivity extends Activity
                 // every resume; only a fresh handoff can restore the session.
                 Log.e(TAG, "loader is gone (getConnection() over Binder failed); "
                         + "re-run anland-connect.sh to restore the display", e);
-                sConnection = null;
+                // Compare-and-clear: a fresh handoff may have replaced sConnection
+                // while this (now-dead) Binder was still in flight. Only drop the
+                // slot if it still holds the Binder we actually failed on, or we
+                // would silently discard the new loader's connection.
+                if (sConnection == conn)
+                    sConnection = null;
                 return;
             }
             if (pfd == null) {
