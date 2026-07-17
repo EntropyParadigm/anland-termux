@@ -48,6 +48,17 @@ KP=$(pgrep -x kwin_wayland | head -1)
 [ -z "$KP" ] && { say "KWin failed — see /root/kwin-zink.log"; tail -8 /root/kwin-lite.log; exit 1; }
 say "KWin up (pid $KP). Producer should be connected."
 
+# force-load desktop effects: enabling them in kwinrc + reconfigure does NOT load
+# a not-yet-loaded effect; KWin needs an explicit loadEffect over its session bus.
+KDB=$(tr '\0' '\n' < "/proc/$KP/environ" 2>/dev/null | grep '^DBUS_SESSION_BUS_ADDRESS=' | cut -d= -f2-)
+if [ -n "$KDB" ]; then
+    for eff in translucency wobblywindows blur; do
+        DBUS_SESSION_BUS_ADDRESS="$KDB" dbus-send --session --dest=org.kde.KWin /Effects \
+            org.kde.kwin.Effects.loadEffect string:"$eff" >/dev/null 2>&1
+    done
+    say "effects loaded: wobbly windows + translucency + blur"
+fi
+
 # one terminal client so there's something on screen to drive from
 export WAYLAND_DISPLAY=wayland-0
 TERM_BIN=$(command -v foot || command -v konsole)
