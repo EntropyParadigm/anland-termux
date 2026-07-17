@@ -93,6 +93,14 @@ public class MainActivity extends Activity
     // the receiver runs on the main thread but the drain hops to a worker thread.
     public static volatile IAnlandConnection sPendingConnection;
 
+    // The loader's connection Binder, kept for the life of the process (or until
+    // the loader dies). Promoted out of sPendingConnection by
+    // consumePendingConnection() and reused by adoptFromLoader() after every
+    // nativeStart. Retaining it is what lets the display come back after the app
+    // is backgrounded: in adopt mode do_connect() has no socket path to dial, so
+    // without a fresh fd from this Binder a resumed session never reconnects.
+    public static volatile IAnlandConnection sConnection;
+
     // ADDED: VirtualKeyboardView instance
     private VirtualKeyboardView virtualKeyboardView;
 
@@ -191,17 +199,42 @@ public class MainActivity extends Activity
     // Termux is not installed there is no legitimate sender, so we reject (close)
     // the fd rather than adopt an unauthenticated connection.
     void consumePendingConnection() {
-        final IAnlandConnection conn = sPendingConnection;
+        // Promote the receiver's handoff into the long-lived slot, then adopt. The
+        // Binder is NOT dropped after this first use: adoptFromLoader() needs it
+        // again on every resume.
+        if (sPendingConnection != null) {
+            sConnection = sPendingConnection;
+            sPendingConnection = null;   // claim the handoff slot for the next delivery
+        }
+        adoptFromLoader();
+    }
+
+    // Pull a fresh daemon fd from the loader and hand it to native. Called after
+    // every nativeStart (and from consumePendingConnection).
+    //
+    // Safe to call repeatedly: CmdEntryPoint keeps its connected LocalSocket in a
+    // field for the life of its process and getConnection() returns a NEW
+    // ParcelFileDescriptor.dup() of it on each call, so the daemon socket never
+    // drops across our nativeStop/nativeStart cycles and each start can simply
+    // re-attach. This re-attach is what makes the desktop survive the app being
+    // backgrounded and foregrounded; without it, adopt-mode do_connect() has no fd
+    // to dial with and idles forever on a black screen.
+    void adoptFromLoader() {
+        final IAnlandConnection conn = sConnection;
         if (conn == null)
             return;
-        sPendingConnection = null;   // claim it; drop the static ref
 
         new Thread(() -> {
             ParcelFileDescriptor pfd;
             try {
                 pfd = conn.getConnection();
             } catch (RemoteException e) {
-                Log.e(TAG, "getConnection() over Binder failed", e);
+                // Includes DeadObjectException: the loader process is gone, so this
+                // Binder can never yield an fd again. Drop it so we stop retrying on
+                // every resume; only a fresh handoff can restore the session.
+                Log.e(TAG, "loader is gone (getConnection() over Binder failed); "
+                        + "re-run anland-connect.sh to restore the display", e);
+                sConnection = null;
                 return;
             }
             if (pfd == null) {
@@ -479,6 +512,11 @@ public class MainActivity extends Activity
             pushRefreshRate();
             applyMicState();
             applyAudioLatency();
+            // onPause() stopped the transport, and in adopt mode the restarted
+            // render thread has no fd to dial with — re-attach a fresh dup from the
+            // loader or the display stays black. Last in the block because it hops
+            // to a worker thread; the sync config pushes above should land first.
+            adoptFromLoader();
         }
 
         // ===== 重新读取触摸板设置 =====
@@ -604,6 +642,9 @@ public class MainActivity extends Activity
         pushRefreshRate();
         applyMicState();
         applyAudioLatency();
+        // Surface recreation on resume restarts the transport too, so it needs the
+        // same re-attach as onResume.
+        adoptFromLoader();
 
         // ===== 更新屏幕尺寸并重置平滑状态 =====
         virtualTouchpad.onSurfaceChanged();
