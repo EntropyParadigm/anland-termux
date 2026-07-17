@@ -55,7 +55,7 @@ public class SettingsActivity extends Activity {
     private static final String KEY_EXTRA_KEYS_LAYOUT = "extra_keys_layout";
     private static final String KEY_KEYBOARD_FLOATING = "keyboard_floating";
     private static final String KEY_NOTIFICATION_ENABLED = "settings_notification";
-    private static final String DEFAULT_SOCKET_PATH = "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
+    private static final String DEFAULT_SOCKET_PATH = MainActivity.DEFAULT_SOCKET_PATH;
     private static final int UNBOUND = -1;
 
     // ===== 新增：触摸板 Key =====

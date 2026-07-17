@@ -82,6 +82,15 @@ static bool cfg_use_root = false;
 static char cfg_helper_path[512] = "";
 static char cfg_bridge_path[512] = "";
 
+/* "Adopt" mode: the Play-build topology. A loader process running under the
+ * Termux uid (CmdEntryPoint via app_process) connects to the daemon's
+ * filesystem socket (same-uid, always allowed) and hands us the *connected*
+ * ctrl fd over a Binder broadcast. Once set, do_connect() consumes cfg_adopt_fd
+ * instead of dialing a path -- cross-uid path connects are blocked by SELinux
+ * MLS categories, so in adopt mode we NEVER fall back to a path/root connect. */
+static bool cfg_adopt_mode = false;
+static int  cfg_adopt_fd = -1;   /* owned once set; consumed by do_connect */
+
 static bool motion_has_last = false;
 static float motion_last_x = 0.0f;
 static float motion_last_y = 0.0f;
@@ -287,7 +296,18 @@ static int recv_fd_via_root_helper(const char *daemon_sock,
         return -1;
     }
 
-    unlink(bridge_path);
+    /* Leading '@' selects the abstract namespace (see unix_sockaddr): no
+     * filesystem entry, so unlink/chmod do not apply. */
+    bool bridge_abstract = (bridge_path[0] == '@');
+    if (!bridge_abstract)
+        unlink(bridge_path);
+
+    struct sockaddr_un addr;
+    socklen_t addrlen = unix_sockaddr(&addr, bridge_path);
+    if (addrlen == 0) {
+        LOGE("root helper: bad bridge socket path '%s'", bridge_path);
+        return -1;
+    }
 
     int lfd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (lfd < 0) {
@@ -295,24 +315,21 @@ static int recv_fd_via_root_helper(const char *daemon_sock,
         return -1;
     }
 
-    struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, bridge_path, sizeof(addr.sun_path) - 1);
-
-    if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(lfd, (struct sockaddr *)&addr, addrlen) < 0) {
         LOGE("root helper: bind(%s) failed: %s", bridge_path, strerror(errno));
         close(lfd);
         return -1;
     }
     /* Root helper runs in a different SELinux/uid context; make the socket file
      * reachable. (Root bypasses DAC, but be permissive anyway.) */
-    chmod(bridge_path, 0777);
+    if (!bridge_abstract)
+        chmod(bridge_path, 0777);
 
     if (listen(lfd, 1) < 0) {
         LOGE("root helper: listen() failed: %s", strerror(errno));
         close(lfd);
-        unlink(bridge_path);
+        if (!bridge_abstract)
+            unlink(bridge_path);
         return -1;
     }
 
@@ -325,7 +342,8 @@ static int recv_fd_via_root_helper(const char *daemon_sock,
     if (pid < 0) {
         LOGE("root helper: fork() failed: %s", strerror(errno));
         close(lfd);
-        unlink(bridge_path);
+        if (!bridge_abstract)
+            unlink(bridge_path);
         return -1;
     }
     if (pid == 0) {
@@ -352,7 +370,8 @@ static int recv_fd_via_root_helper(const char *daemon_sock,
     int status = 0;
     waitpid(pid, &status, 0);
     close(lfd);
-    unlink(bridge_path);
+    if (!bridge_abstract)
+        unlink(bridge_path);
 
     if (fd < 0)
         LOGE("root helper: did not receive daemon fd (su status=%d)", status);
@@ -364,6 +383,9 @@ static int do_connect(struct consumer_state *s)
     /* Snapshot the connection config for this attempt. */
     pthread_mutex_lock(&cfg_lock);
     bool use_root = cfg_use_root;
+    bool adopt_mode = cfg_adopt_mode;
+    int  adopt_fd = cfg_adopt_fd;
+    cfg_adopt_fd = -1;   /* consume: an adopted fd is single-use */
     char sock_path[sizeof(cfg_socket_path)];
     char helper_path[sizeof(cfg_helper_path)];
     char bridge_path[sizeof(cfg_bridge_path)];
@@ -371,6 +393,14 @@ static int do_connect(struct consumer_state *s)
     memcpy(helper_path, cfg_helper_path, sizeof(helper_path));
     memcpy(bridge_path, cfg_bridge_path, sizeof(bridge_path));
     pthread_mutex_unlock(&cfg_lock);
+
+    /* In adopt mode with no fd in hand, there is nothing to (re)connect to:
+     * do NOT dial a path. Return failure so the render loop idles until
+     * CmdEntryPoint delivers a fresh connected fd (which re-arms need_reconnect). */
+    if (adopt_mode && adopt_fd < 0) {
+        LOGI("adopt mode: waiting for a connected fd");
+        return -1;
+    }
 
     const char *sock = sock_path;
 
@@ -420,10 +450,17 @@ static int do_connect(struct consumer_state *s)
     if (collect_dmabufs(s) < 0)
         return -1;
 
-    LOGI("connecting to %s (%dx%d, %d bufs, root=%d)", sock,
-         s->screen_w, s->screen_h, s->buf_count, use_root);
+    LOGI("connecting to %s (%dx%d, %d bufs, root=%d, adopt=%d)", sock,
+         s->screen_w, s->screen_h, s->buf_count, use_root, adopt_mode);
 
-    if (use_root) {
+    if (adopt_mode) {
+        /* connect_to_deamon_with_fd takes ownership of adopt_fd (closes it on
+         * failure), exactly like the root-helper path below. */
+        if (connect_to_deamon_with_fd(&s->ctx, adopt_fd) < 0) {
+            LOGE("connect_to_deamon_with_fd (adopted) failed");
+            return -1;
+        }
+    } else if (use_root) {
         int ctrl_fd = recv_fd_via_root_helper(sock, helper_path, bridge_path);
         if (ctrl_fd < 0) {
             LOGE("root helper connect failed");
@@ -617,6 +654,24 @@ Java_com_anland_termux_Native_nativeConfigure(
 
     LOGI("configured: socket=%s root=%d helper=%s bridge=%s",
          cfg_socket_path, cfg_use_root, cfg_helper_path, cfg_bridge_path);
+}
+
+/* Adopt an already-connected daemon ctrl fd (from CmdEntryPoint via a Binder
+ * broadcast). Takes ownership of `fd`; enables adopt mode so do_connect() uses
+ * this fd instead of dialing a socket path, then re-arms the render thread. */
+JNIEXPORT void JNICALL
+Java_com_anland_termux_Native_nativeAdoptConnection(
+    JNIEnv *env, jclass clazz, jint fd)
+{
+    pthread_mutex_lock(&cfg_lock);
+    if (cfg_adopt_fd >= 0)
+        close(cfg_adopt_fd);   /* replace a previous, still-unconsumed fd */
+    cfg_adopt_fd = fd;
+    cfg_adopt_mode = true;
+    pthread_mutex_unlock(&cfg_lock);
+
+    g_state.need_reconnect = true;   /* render thread picks up the fd on next loop */
+    LOGI("adopt connection fd=%d", fd);
 }
 
 JNIEXPORT void JNICALL

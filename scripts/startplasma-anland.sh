@@ -65,7 +65,10 @@ start_termux_native() {
     set_common_environment
     unset PULSE_SERVER
     export XDG_RUNTIME_DIR="$TMPDIR/run"
-    export ANLAND_SOCKET="$TMPDIR/anland/display_daemon.sock"
+    # A pre-set ANLAND_SOCKET (e.g. '@anland-display' for the abstract
+    # namespace, needed with Google-Play-build Termux where the filesystem
+    # socket is unreachable across uids) is kept for the daemon and clients.
+    export ANLAND_SOCKET="${ANLAND_SOCKET:-$TMPDIR/anland/display_daemon.sock}"
     export ANLAND_NO_DRM_DEVICE=1
     export EGL_PLATFORM=surfaceless
     enable_kgsl
@@ -79,7 +82,8 @@ start_container() {
     sudo chmod -R 777 /tmp/anland
     stop_plasma
     set_common_environment
-    export ANLAND_SOCKET=/tmp/anland/display_daemon.sock
+    # A pre-set ANLAND_SOCKET (e.g. '@anland-display') is kept; see above.
+    export ANLAND_SOCKET="${ANLAND_SOCKET:-/tmp/anland/display_daemon.sock}"
 
     if [[ $ANLAND_HAVE_DRM -eq 1 ]]; then
         export ANLAND_DRM_DEVICE=/dev/dri/renderD128

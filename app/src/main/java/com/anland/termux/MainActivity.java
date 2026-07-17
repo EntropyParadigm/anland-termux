@@ -12,6 +12,7 @@ import android.hardware.display.DisplayManager;
 import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.ParcelFileDescriptor;
 import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
@@ -59,7 +60,9 @@ public class MainActivity extends Activity
     // Camera service fds/threads are created once and persist across reconnects;
     // this guards that one-time init (see applyCameraState).
     private boolean cameraInited = false;
-    private static final String DEFAULT_SOCKET_PATH = "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
+    // Shared with SettingsActivity. A leading '@' means an abstract-namespace
+    // socket (no filesystem path); the value is passed to JNI unmodified.
+    static final String DEFAULT_SOCKET_PATH = "/data/data/com.termux/files/usr/tmp/anland/display_daemon.sock";
     private static final String KEY_ACCESSIBILITY_ENABLED = "accessibility_key_intercept";
     private static final String KEY_EXTRA_KEYS_ENABLED = "extra_keys_bar";
     private static final String KEY_AUTO_SHOW_EXTRA_KEYS = "auto_show_extra_keys";
@@ -148,6 +151,35 @@ public class MainActivity extends Activity
         Native.nativeSetCustomResolution(customW, customH);
     }
 
+    // Delivered a connected daemon fd by CmdEntryPoint via AdoptConnectionReceiver.
+    // Detach the raw fd and hand it to native, which switches to "adopt mode" and
+    // (re)connects using this fd instead of dialing a socket path. Runs on the main
+    // thread; native is thread-safe and re-arms its render thread.
+    void onAdoptConnection(ParcelFileDescriptor pfd) {
+        if (pfd == null)
+            return;
+        int fd = pfd.detachFd();   // native now owns the fd
+        Native.nativeAdoptConnection(fd);
+    }
+
+    // Extract an adopt-connection PFD from a launch/new intent, if present.
+    private void handleAdoptIntent(Intent intent) {
+        if (intent == null
+                || !CmdEntryPoint.ACTION_ADOPT_CONNECTION.equals(intent.getAction()))
+            return;
+        ParcelFileDescriptor pfd =
+            intent.getParcelableExtra(CmdEntryPoint.EXTRA_CONNECTION_FD);
+        if (pfd != null)
+            onAdoptConnection(pfd);
+    }
+
+    @Override
+    protected void onNewIntent(Intent intent) {
+        super.onNewIntent(intent);
+        setIntent(intent);
+        handleAdoptIntent(intent);
+    }
+
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
@@ -223,6 +255,10 @@ public class MainActivity extends Activity
 
         setContentView(root);
         surfaceView.getHolder().addCallback(this);
+
+        // Adopt a daemon connection delivered by AdoptConnectionReceiver on a cold
+        // start (Play-build topology; see CmdEntryPoint).
+        handleAdoptIntent(getIntent());
 
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             // When the IME hides by any means (toggle, system back, or the IME's

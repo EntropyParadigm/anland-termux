@@ -70,6 +70,30 @@ int recv_fds(int sock, void *data, size_t data_len,
     return (int)n;
 }
 
+int unix_sockaddr(struct sockaddr_un *addr, socklen_t *addr_len,
+                  const char *path)
+{
+    size_t name_len = strlen(path);
+
+    memset(addr, 0, sizeof(*addr));
+    addr->sun_family = AF_UNIX;
+
+    if (path[0] == '@') {
+        /* Abstract namespace: '@name' -> leading NUL byte, no trailing NUL. */
+        name_len--;
+        if (name_len == 0 || name_len > sizeof(addr->sun_path) - 1)
+            return -1;
+        memcpy(addr->sun_path + 1, path + 1, name_len);
+        *addr_len = offsetof(struct sockaddr_un, sun_path) + 1 + name_len;
+    } else {
+        if (name_len >= sizeof(addr->sun_path))
+            return -1;
+        memcpy(addr->sun_path, path, name_len + 1);
+        *addr_len = sizeof(*addr);
+    }
+    return 0;
+}
+
 int connect_unix(const char *path)
 {
     int fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -77,11 +101,9 @@ int connect_unix(const char *path)
         return -1;
 
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    strncpy(addr.sun_path, path, sizeof(addr.sun_path) - 1);
-
-    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    socklen_t addr_len;
+    if (unix_sockaddr(&addr, &addr_len, path) < 0 ||
+        connect(fd, (struct sockaddr *)&addr, addr_len) < 0) {
         close(fd);
         return -1;
     }

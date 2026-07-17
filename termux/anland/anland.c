@@ -54,13 +54,19 @@ static const char *default_socket_path(void)
     return path;
 }
 
+/* Precedence: --socket / positional argument, then $ANLAND_SOCKET, then the
+ * default. A value starting with '@' names an abstract-namespace socket. */
 static const char *parse_socket_path(int argc, char **argv)
 {
-    if (argc <= 1)
+    if (argc <= 1) {
+        const char *env = getenv("ANLAND_SOCKET");
+        if (env && env[0] != '\0')
+            return env;
         return default_socket_path();
+    }
     if (strcmp(argv[1], "--socket") == 0) {
         if (argc < 3 || argv[2][0] == '\0') {
-            fprintf(stderr, "usage: anland [--socket PATH] [PATH]\n");
+            fprintf(stderr, "usage: anland [--socket PATH|@NAME] [PATH|@NAME]\n");
             exit(1);
         }
         return argv[2];
@@ -72,6 +78,10 @@ static int ensure_socket_parent(const char *sock_path)
 {
     char dir[sizeof(((struct sockaddr_un *)0)->sun_path)];
     char *slash;
+
+    /* Abstract sockets live outside the filesystem; nothing to create. */
+    if (sock_path[0] == '@')
+        return 0;
 
     if (strlen(sock_path) >= sizeof(dir)) {
         fprintf(stderr, "daemon: socket path is too long\n");
@@ -313,6 +323,7 @@ static void handle_new_connection(int listen_fd)
 int main(int argc, char **argv)
 {
     const char *sock_path = parse_socket_path(argc, argv);
+    bool sock_is_abstract = sock_path[0] == '@';
 
     signal(SIGINT, handle_signal);
     signal(SIGTERM, handle_signal);
@@ -321,7 +332,8 @@ int main(int argc, char **argv)
     if (ensure_socket_parent(sock_path) < 0)
         return 1;
 
-    unlink(sock_path);
+    if (!sock_is_abstract)
+        unlink(sock_path);
     int listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listen_fd < 0) {
         perror("socket");
@@ -329,15 +341,13 @@ int main(int argc, char **argv)
     }
 
     struct sockaddr_un addr;
-    memset(&addr, 0, sizeof(addr));
-    addr.sun_family = AF_UNIX;
-    if (strlen(sock_path) >= sizeof(addr.sun_path)) {
+    socklen_t addr_len;
+    if (unix_sockaddr(&addr, &addr_len, sock_path) < 0) {
         fprintf(stderr, "daemon: socket path is too long\n");
         return 1;
     }
-    memcpy(addr.sun_path, sock_path, strlen(sock_path) + 1);
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    if (bind(listen_fd, (struct sockaddr *)&addr, addr_len) < 0) {
         perror("bind");
         return 1;
     }
@@ -379,7 +389,8 @@ int main(int argc, char **argv)
     client_free(producer);
     close(listen_fd);
     close(epoll_fd);
-    unlink(sock_path);
+    if (!sock_is_abstract)
+        unlink(sock_path);
     fprintf(stderr, "daemon: shutdown\n");
     return 0;
 }

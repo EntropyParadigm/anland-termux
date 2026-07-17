@@ -10,6 +10,8 @@ This guide walks you through downloading, installing, and using [Anland: Termux]
 
 Before installing Anland: Termux, check that your installed Termux app comes from the [official GitHub releases](https://github.com/termux/termux-app/releases) **(not F-Droid or Google Play)**. This project supports only the Termux app from the official GitHub releases. To migrate Termux to the GitHub version, refer to the official backup and restore guide: https://wiki.termux.com/wiki/Backing_up_Termux
 
+If you cannot migrate, this fork also supports Google Play and F-Droid Termux builds through a compatibility loader; see [Google Play / F-Droid Termux builds](#google-play--f-droid-termux-builds) below.
+
 ```sh
 # Run this command in Termux; it should output 'GITHUB'
 echo $TERMUX_APP__APK_RELEASE
@@ -131,3 +133,31 @@ For example, to run Anland: Termux in a Debian 13 PRoot container, download thes
    ```
 
 4. Switch to the “Anland Termux” app on Android and enjoy your Wayland desktop.
+
+## Google Play / F-Droid Termux builds
+
+The standard setup relies on `sharedUserId`: the display app joins Termux’s uid so both sides can open the same socket. That only works when the display app is signed with the same key as the installed Termux app. The Google Play and F-Droid Termux builds are signed with keys we do not have, so an APK using `sharedUserId` with them would be rejected by Android at install time. This fork adds a loader-based flow for those builds instead.
+
+> [!NOTE]
+> Abstract-namespace sockets (`ANLAND_SOCKET=@name`) are **not** a cross-app solution on stock Android: SELinux MLS blocks abstract-socket connections between different app uids. The `@` mode remains available as a same-uid fallback only.
+
+How it works: a small Java loader inside the display APK (`com.anland.termux.CmdEntryPoint`) is started **under the Termux uid** via `/system/bin/app_process`. Running as Termux, it connects to the daemon’s normal filesystem socket, then hands the connected file descriptor to the display app over a Binder `ParcelFileDescriptor` broadcast — the same technique termux-x11 uses.
+
+1. Install the display app APK normally (no Termux reinstall or data wipe is needed).
+
+2. Start the daemon and your desktop as usual (see [Usage](#usage) above).
+
+3. In **native Termux** (not inside a container — `pm` and `app_process` are Android binaries), run the helper script: [anland-play-connect.sh](../scripts/anland-play-connect.sh)
+
+   ```sh
+   curl -LO https://github.com/lfdevs/anland-termux/raw/refs/heads/termux/scripts/anland-play-connect.sh
+   chmod +x ./anland-play-connect.sh
+   ./anland-play-connect.sh
+   ```
+
+   This also works when the desktop runs in a PRoot-Distro container: the daemon’s `$TMPDIR` socket still lives under `/data/data/com.termux/files/usr/tmp` on the real filesystem. Only if you overrode `TMPDIR` inside the container do you need to pass the real socket path, e.g. `./anland-play-connect.sh /path/to/display_daemon.sock`.
+
+4. Switch to the “Anland Termux” app on Android.
+
+> [!WARNING]
+> The broadcast receiver that adopts the connection is currently unauthenticated — any app on the device could send it a file descriptor. This is the same trust model as termux-x11; hardening it is a TODO.

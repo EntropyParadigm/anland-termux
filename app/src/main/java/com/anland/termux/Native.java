@@ -16,6 +16,12 @@ public final class Native {
     public static native void nativeConfigure(String socketPath, boolean useRoot,
                                               String helperPath, String bridgePath);
 
+    // Adopt an already-connected daemon control fd handed to us by CmdEntryPoint
+    // (which runs under the Termux uid and dials the daemon's filesystem socket).
+    // Enables "adopt mode": the render thread connects using this fd instead of a
+    // socket path. Native takes ownership of the fd.
+    public static native void nativeAdoptConnection(int fd);
+
     // With static natives there is no `thiz`, so native is handed the object it
     // calls back into (the Clipboard instance hosting nativeSetClipboardText /
     // nativeClipListening / nativeClipboardSync). It is stored as the global ref
