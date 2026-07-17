@@ -27,6 +27,12 @@
 #define LOGI(...) __android_log_print(ANDROID_LOG_INFO, TAG, __VA_ARGS__)
 #define LOGE(...) __android_log_print(ANDROID_LOG_ERROR, TAG, __VA_ARGS__)
 
+/* Upper bound on a single peer-supplied clipboard payload. ev.clipboard.size is
+ * a peer-controlled uint32_t; without a cap, size==0xFFFFFFFF wraps the 32-bit
+ * `size + 1` to 0 -> malloc(0) followed by a ~4GB recv -> heap overflow. Anything
+ * larger than this is treated as malformed and dropped. */
+#define MAX_CLIPBOARD_BYTES (16u * 1024u * 1024u)
+
 #define PIXEL_FORMAT_RGBA_8888 1
 #define MAX_COLLECT_BUFS 8
 
@@ -236,7 +242,17 @@ static void *event_thread_func(void *arg)
              * pre-created fds back over SCM_RIGHTS. */
             handle_resource_request(s->ctx, &ev);
         } else if (ev.type == OUTPUT_TYPE_CLIPBOARD && ev.clipboard.size > 0) {
-            char *buf = malloc(ev.clipboard.size + 1);
+            /* ev.clipboard.size is peer-controlled; reject oversized/overflowing
+             * lengths before allocating. Drop the message like other malformed
+             * events (the extend-data payload is left unread; poll_output_event
+             * resynchronizes on the next framed event). */
+            if (ev.clipboard.size > MAX_CLIPBOARD_BYTES) {
+                LOGE("event thread: clipboard size %u exceeds max %u; dropping",
+                     ev.clipboard.size, MAX_CLIPBOARD_BYTES);
+                continue;
+            }
+            /* Do the +1 in size_t so the addition cannot wrap. */
+            char *buf = malloc((size_t)ev.clipboard.size + 1);
             if (!buf)
                 continue;
 
@@ -658,11 +674,37 @@ Java_com_anland_termux_Native_nativeConfigure(
 
 /* Adopt an already-connected daemon ctrl fd (from CmdEntryPoint via a Binder
  * broadcast). Takes ownership of `fd`; enables adopt mode so do_connect() uses
- * this fd instead of dialing a socket path, then re-arms the render thread. */
+ * this fd instead of dialing a socket path, then re-arms the render thread.
+ *
+ * SECURITY: AdoptConnectionReceiver is exported and unauthenticated, so any
+ * co-installed app can broadcast a socket it controls and try to hijack the
+ * display session. The trust anchor is peer identity: the LEGITIMATE adopted
+ * fd was connected by CmdEntryPoint running under the Termux package's uid, so
+ * the socket's peer credentials (SO_PEERCRED) name the Termux uid. A malicious
+ * app can only hand us a socketpair whose peer is ITS OWN uid. We therefore
+ * require the peer uid to equal the installed Termux package's uid (resolved in
+ * Java and passed in as expectedPeerUid); anything else is rejected and closed. */
 JNIEXPORT void JNICALL
 Java_com_anland_termux_Native_nativeAdoptConnection(
-    JNIEnv *env, jclass clazz, jint fd)
+    JNIEnv *env, jclass clazz, jint fd, jint expectedPeerUid)
 {
+    /* Authenticate the fd's peer before adopting it. SO_PEERCRED on an AF_UNIX
+     * socket returns the credentials of the process that connected the other
+     * end -- the daemon (Termux uid) in the legit CmdEntryPoint handoff. */
+    struct ucred cred;
+    socklen_t len = sizeof(cred);
+    if (getsockopt(fd, SOL_SOCKET, SO_PEERCRED, &cred, &len) != 0) {
+        LOGE("adopt rejected: SO_PEERCRED failed on fd=%d: %s", fd, strerror(errno));
+        close(fd);
+        return;
+    }
+    if ((int)cred.uid != expectedPeerUid) {
+        LOGE("adopt rejected: peer uid %d != expected Termux uid %d (fd=%d)",
+             (int)cred.uid, expectedPeerUid, fd);
+        close(fd);
+        return;
+    }
+
     pthread_mutex_lock(&cfg_lock);
     if (cfg_adopt_fd >= 0)
         close(cfg_adopt_fd);   /* replace a previous, still-unconsumed fd */
@@ -671,7 +713,7 @@ Java_com_anland_termux_Native_nativeAdoptConnection(
     pthread_mutex_unlock(&cfg_lock);
 
     g_state.need_reconnect = true;   /* render thread picks up the fd on next loop */
-    LOGI("adopt connection fd=%d", fd);
+    LOGI("adopt connection fd=%d peer_uid=%d ok", fd, (int)cred.uid);
 }
 
 JNIEXPORT void JNICALL

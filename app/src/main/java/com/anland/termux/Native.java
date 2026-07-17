@@ -20,7 +20,11 @@ public final class Native {
     // (which runs under the Termux uid and dials the daemon's filesystem socket).
     // Enables "adopt mode": the render thread connects using this fd instead of a
     // socket path. Native takes ownership of the fd.
-    public static native void nativeAdoptConnection(int fd);
+    //
+    // expectedPeerUid is the uid of the installed Termux package, resolved by the
+    // caller. Native authenticates the fd via SO_PEERCRED and rejects (closes) it
+    // unless the socket's peer uid matches — see the JNI implementation.
+    public static native void nativeAdoptConnection(int fd, int expectedPeerUid);
 
     // With static natives there is no `thiz`, so native is handed the object it
     // calls back into (the Clipboard instance hosting nativeSetClipboardText /

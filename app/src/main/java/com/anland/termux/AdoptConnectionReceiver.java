@@ -12,13 +12,13 @@ import android.util.Log;
  * consumer.
  *
  * Trust model matches termux-x11: manifest-registered, exported, no permission.
- *
- * HARDENING TODO: because there is no permission or sender check, any app on the
- * device could send this broadcast with an fd of its choosing. That fd would be
- * adopted as the daemon control connection. A future revision should verify the
- * sender (e.g. a shared signature permission is impossible across the Play-build
- * split, so use a nonce/token handed out over the same channel, or check the
- * peer via SO_PEERCRED once adopted).
+ * A signature permission is impossible across the Play-build split (the loader is
+ * signed differently and runs under the Termux uid) and there is no pre-shared
+ * secret across the uid boundary, so authentication happens AFTER adoption: the
+ * fd is only accepted if its peer credentials (SO_PEERCRED) name the installed
+ * Termux package's uid. See MainActivity.onAdoptConnection and the JNI
+ * nativeAdoptConnection implementation. A malicious app can only forge a
+ * socketpair whose peer is its own uid, which fails that check.
  */
 public final class AdoptConnectionReceiver extends BroadcastReceiver {
     private static final String TAG = "AnlandAdoptRecv";

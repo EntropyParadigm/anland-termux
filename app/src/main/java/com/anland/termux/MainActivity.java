@@ -151,15 +151,52 @@ public class MainActivity extends Activity
         Native.nativeSetCustomResolution(customW, customH);
     }
 
+    // Package names that all resolve to the Termux app. GitHub, F-Droid and Play
+    // builds of Termux all ship as "com.termux", so a single name suffices, but
+    // this stays a list so additional distributions can be added without touching
+    // the resolution logic.
+    private static final String[] TERMUX_PACKAGES = { "com.termux" };
+
+    // Resolve the uid of the installed Termux package. The adopted daemon fd was
+    // connected by CmdEntryPoint running under this uid, so it is the trust anchor
+    // native uses (SO_PEERCRED) to reject fds forged by other apps. Returns -1 if
+    // Termux is not installed — in which case there is no legitimate handoff.
+    private int resolveTermuxUid() {
+        PackageManager pm = getPackageManager();
+        for (String pkg : TERMUX_PACKAGES) {
+            try {
+                return pm.getPackageUid(pkg, 0);
+            } catch (PackageManager.NameNotFoundException e) {
+                // try the next candidate
+            }
+        }
+        return -1;
+    }
+
     // Delivered a connected daemon fd by CmdEntryPoint via AdoptConnectionReceiver.
     // Detach the raw fd and hand it to native, which switches to "adopt mode" and
     // (re)connects using this fd instead of dialing a socket path. Runs on the main
     // thread; native is thread-safe and re-arms its render thread.
+    //
+    // The receiver is exported and unauthenticated, so before adopting we resolve
+    // the expected Termux uid and let native verify the fd's peer credentials. If
+    // Termux is not installed there is no legitimate sender, so we reject (close)
+    // the fd rather than adopt an unauthenticated connection.
     void onAdoptConnection(ParcelFileDescriptor pfd) {
         if (pfd == null)
             return;
+        int expectedPeerUid = resolveTermuxUid();
+        if (expectedPeerUid < 0) {
+            Log.e(TAG, "adopt rejected: Termux package not installed; closing fd");
+            try {
+                pfd.close();
+            } catch (java.io.IOException e) {
+                // best-effort close
+            }
+            return;
+        }
         int fd = pfd.detachFd();   // native now owns the fd
-        Native.nativeAdoptConnection(fd);
+        Native.nativeAdoptConnection(fd, expectedPeerUid);
     }
 
     // Extract an adopt-connection PFD from a launch/new intent, if present.
