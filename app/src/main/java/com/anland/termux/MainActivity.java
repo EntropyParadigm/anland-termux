@@ -13,6 +13,7 @@ import android.content.SharedPreferences;
 import android.os.Build;
 import android.os.Bundle;
 import android.os.ParcelFileDescriptor;
+import android.os.RemoteException;
 import android.util.Log;
 import android.view.Display;
 import android.view.Gravity;
@@ -86,6 +87,11 @@ public class MainActivity extends Activity
     private String mAppliedLayoutJson = "";
 
     public static MainActivity sInstance;
+
+    // Connection Binder delivered by AdoptConnectionReceiver, awaiting consumption.
+    // Set by the receiver; drained by consumePendingConnection(). Volatile because
+    // the receiver runs on the main thread but the drain hops to a worker thread.
+    public static volatile IAnlandConnection sPendingConnection;
 
     // ADDED: VirtualKeyboardView instance
     private VirtualKeyboardView virtualKeyboardView;
@@ -173,48 +179,57 @@ public class MainActivity extends Activity
         return -1;
     }
 
-    // Delivered a connected daemon fd by CmdEntryPoint via AdoptConnectionReceiver.
-    // Detach the raw fd and hand it to native, which switches to "adopt mode" and
-    // (re)connects using this fd instead of dialing a socket path. Runs on the main
-    // thread; native is thread-safe and re-arms its render thread.
+    // Consume a connection Binder delivered by AdoptConnectionReceiver. Pull the
+    // connected daemon fd from CmdEntryPoint over a Binder transaction (fds are
+    // forbidden in broadcast extras but allowed here), then hand the raw fd to
+    // native, which switches to "adopt mode" and (re)connects using this fd
+    // instead of dialing a socket path.
     //
-    // The receiver is exported and unauthenticated, so before adopting we resolve
-    // the expected Termux uid and let native verify the fd's peer credentials. If
+    // The Binder call may block, so it runs on a worker thread. The receiver is
+    // exported and unauthenticated, so before adopting we resolve the expected
+    // Termux uid and let native verify the fd's peer credentials (SO_PEERCRED). If
     // Termux is not installed there is no legitimate sender, so we reject (close)
     // the fd rather than adopt an unauthenticated connection.
-    void onAdoptConnection(ParcelFileDescriptor pfd) {
-        if (pfd == null)
+    void consumePendingConnection() {
+        final IAnlandConnection conn = sPendingConnection;
+        if (conn == null)
             return;
-        int expectedPeerUid = resolveTermuxUid();
-        if (expectedPeerUid < 0) {
-            Log.e(TAG, "adopt rejected: Termux package not installed; closing fd");
-            try {
-                pfd.close();
-            } catch (java.io.IOException e) {
-                // best-effort close
-            }
-            return;
-        }
-        int fd = pfd.detachFd();   // native now owns the fd
-        Native.nativeAdoptConnection(fd, expectedPeerUid);
-    }
+        sPendingConnection = null;   // claim it; drop the static ref
 
-    // Extract an adopt-connection PFD from a launch/new intent, if present.
-    private void handleAdoptIntent(Intent intent) {
-        if (intent == null
-                || !CmdEntryPoint.ACTION_ADOPT_CONNECTION.equals(intent.getAction()))
-            return;
-        ParcelFileDescriptor pfd =
-            intent.getParcelableExtra(CmdEntryPoint.EXTRA_CONNECTION_FD);
-        if (pfd != null)
-            onAdoptConnection(pfd);
+        new Thread(() -> {
+            ParcelFileDescriptor pfd;
+            try {
+                pfd = conn.getConnection();
+            } catch (RemoteException e) {
+                Log.e(TAG, "getConnection() over Binder failed", e);
+                return;
+            }
+            if (pfd == null) {
+                Log.e(TAG, "getConnection() returned no fd");
+                return;
+            }
+            int expectedPeerUid = resolveTermuxUid();
+            if (expectedPeerUid < 0) {
+                Log.e(TAG, "adopt rejected: Termux package not installed; closing fd");
+                try {
+                    pfd.close();
+                } catch (java.io.IOException e) {
+                    // best-effort close
+                }
+                return;
+            }
+            int fd = pfd.detachFd();   // native now owns the fd
+            Native.nativeAdoptConnection(fd, expectedPeerUid);
+        }, "anland-adopt").start();
     }
 
     @Override
     protected void onNewIntent(Intent intent) {
         super.onNewIntent(intent);
         setIntent(intent);
-        handleAdoptIntent(intent);
+        // A pending connection may have been stashed by the receiver just before it
+        // brought us forward; drain it defensively.
+        consumePendingConnection();
     }
 
     @Override
@@ -294,8 +309,10 @@ public class MainActivity extends Activity
         surfaceView.getHolder().addCallback(this);
 
         // Adopt a daemon connection delivered by AdoptConnectionReceiver on a cold
-        // start (Play-build topology; see CmdEntryPoint).
-        handleAdoptIntent(getIntent());
+        // start (Play-build topology; see CmdEntryPoint). The receiver stashed the
+        // connection Binder in sPendingConnection before launching us; pull the fd
+        // from it over Binder. Native lib is already loaded (static initializer).
+        consumePendingConnection();
 
         root.setOnApplyWindowInsetsListener((v, insets) -> {
             // When the IME hides by any means (toggle, system back, or the IME's
