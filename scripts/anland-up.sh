@@ -14,6 +14,23 @@ SESSION_LOG="$HOME/anland-session.log"
 START="$HOME/startplasma-anland.sh"
 [ -x "$START" ] || START="./startplasma-anland.sh"
 
+# --- Hard-won settings. Do not drop these. ---
+#
+# plasmashell (QtQuick) rendering through freedreno/KGSL either dies silently or
+# paints RGB static. Software QML fixes both; KWin and normal apps keep full GPU
+# acceleration, so this costs nothing you'd notice. Must be exported BEFORE the
+# session starts so plasmashell inherits it.
+export QT_QUICK_BACKEND=software
+#
+# The KDE screen locker is an unrecoverable trap in a proot container: PAM cannot
+# authenticate (root has no usable password), and KWin refuses to unlock without
+# it -- the session is then only recoverable by restarting it. Keep autolock off.
+if [ ! -f "$HOME/.config/kscreenlockerrc" ]; then
+    mkdir -p "$HOME/.config"
+    printf '[Daemon]\nAutolock=false\nLockOnResume=false\nTimeout=0\n' \
+        > "$HOME/.config/kscreenlockerrc"
+fi
+
 # 1. Ensure the daemon is running (native path also (re)starts it, but starting
 #    it here first makes the log deterministic and works in-container too).
 if ! pgrep -x anland >/dev/null 2>&1; then
@@ -41,6 +58,10 @@ printf '\n'
 if [ "$ok" = 1 ]; then
     echo "compositor up — producer connected."
     echo "Next: (1) open the Anland Termux app, then (2) run:  bash anland-connect.sh"
+    echo
+    echo "NOTE: if you restarted this session while the app was already running,"
+    echo "      fully close and reopen the app first — it holds a Binder from the"
+    echo "      previous loader and will otherwise ignore the new handoff."
 else
     echo "compositor did NOT reach 'producer connected' in time."
     echo "Check $SESSION_LOG and $DAEMON_LOG."
