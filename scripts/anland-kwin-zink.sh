@@ -31,7 +31,7 @@ export FD_FORCE_KGSL=1 XWAYLAND_FORCE_KGSL_SURFACELESS=1
 export ANLAND_NO_DRM_DEVICE=1 EGL_PLATFORM=surfaceless
 export ANLAND_SOCKET=/tmp/anland/display_daemon.sock
 export XDG_RUNTIME_DIR=/run/user/0 QT_QPA_PLATFORM=wayland
-export TU_KMD=kgsl TU_DEBUG=sysmem MESA_VK_WSI_PRESENT_MODE=mailbox   # zink/turnip: GPU QML, no sw fallback
+export TU_KMD=kgsl TU_DEBUG=sysmem MESA_VK_WSI_PRESENT_MODE=mailbox vblank_mode=3   # zink/turnip: GPU QML, no sw fallback
 unset DISPLAY PULSE_SERVER
 
 # standalone KWin: it creates its own wayland-0 socket and connects to anland as
