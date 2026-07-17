@@ -1,6 +1,7 @@
 package com.anland.termux;
 
 import android.annotation.SuppressLint;
+import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
 import android.net.LocalSocket;
@@ -116,6 +117,11 @@ public final class CmdEntryPoint {
 
             Intent intent = new Intent(ACTION_ADOPT_CONNECTION);
             intent.setPackage(TARGET_PACKAGE);
+            // Target the receiver explicitly. Under the Play build the two apps are
+            // separately signed with distinct uids, and the sending uid lacks
+            // QUERY_ALL_PACKAGES; an explicit component makes delivery reliable
+            // rather than relying on package-visibility resolution of setPackage.
+            intent.setComponent(new ComponentName(TARGET_PACKAGE, TARGET_PACKAGE + ".AdoptConnectionReceiver"));
             intent.putExtra(EXTRA_CONNECTION_FD, pfd);
             // FLAG_RECEIVER_FROM_SHELL: lets a stopped app receive the broadcast
             // when launched from a shell/root uid. Harmless from a normal app uid.
